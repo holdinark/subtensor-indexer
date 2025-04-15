@@ -54,7 +54,7 @@ jobs:
         env:
           PAT: ${{ secrets.PAT_FOR_PRIVATE_REPO }}
         run: |
-          git clone https://${PAT}github.com/holdinark/indexer-cluster.git
+          git clone https://${PAT}@github.com/holdinark/indexer-cluster.git
 
           for dir in ./scraper_service/shovel_*/; do
             if [ -f "${dir}Dockerfile" ]; then
