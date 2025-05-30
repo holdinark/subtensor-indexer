@@ -1,105 +1,330 @@
 # Subtensor Indexer
 
-NOTE: This project is a work in progress.
+A high-performance indexer for the Subtensor blockchain with fast querying capabilities.
 
-Indexer for the Subtensor blockchain.
+## 🚀 Quick Start
 
-Archive nodes are notoriously slow and expensive to query. The aim of this project is to allow indexing of key data in a DB with extremely fast query and analysis capabilities.
+Get up and running in development mode with live code reloading:
 
-[Clickhouse](https://clickhouse.com/docs/en/intro) was chosen as the database because it is fast and efficient at storing and retrieving large amounts of time series data.
+```bash
+# 1. Configure environment
+cp .env.example .env
+# Edit .env with your settings
 
-## Overview
+# 2. Start in development mode (with live reloading)
+make run
+```
 
-At the root of this project is a `docker-compose.yml` file which is responsible for setting up the Clickhouse database and an array of "shovels".
+That's it! Your services will start with automatic code reloading - edit any Python file and see changes instantly.
 
-A shovel is a program responsible for scraping a particular class of data and indexing it into Clickhouse.
+## 📋 Available Commands
 
-Shovels are written in Python, and share common functions found under `scraper_service/shared`.
+Run `make help` to see all available commands:
 
-All a shoves needs to define is a function to execute for every block number. Shared logic such as connecting to the Clickhouse DB, walking historical blocks, and keeping up with new finalized blocks is handled under the hood.
+### 🏗️ Building
 
-### Implementors Guide
+- `make build` - Build all services
+- `make build-fast` - Build all services in parallel
+- `make build-clean` - Clean build (no cache)
 
-Want to add a new shovel? READ THIS!
+### 🚀 Running
 
-1. Create a new Python program with a Dockerfile, see `scraper_service/shovel_events` for a reference
-2. Create a new class that inherits the `ShovelBaseClass`, implement the `process_block` method, and call `.start` on it with a unique shovel identifier
+- `make run` - **Quick start in development mode** (with live reloading)
+- `make up` - Start all services
+- `make down` - Stop all services
+- `make restart` - Restart all services
+
+### 🔧 Development
+
+- `make dev-mode` - Start with live code reloading (changes reflected instantly)
+- `make dev-build` - Build services in parallel
+- `make dev-up` - Start development environment
+
+### 📊 Monitoring
+
+- `make logs` - View logs from all services
+- `make health` - Check health of all services
+
+### 🧹 Maintenance
+
+- `make clean` - Stop services and remove containers
+- `make prune` - Clean up Docker system
+
+### Examples
+
+```bash
+# Build specific service
+make build SERVICE=shovel_events
+
+# View logs for specific service
+make logs SERVICE=shovel_events
+
+# Restart specific service
+docker compose restart shovel_events
+```
+
+## 🏗️ Architecture
+
+This project uses [ClickHouse](https://clickhouse.com/docs/en/intro) as the database for fast time-series data storage and querying.
+
+### Core Components
+
+1. **ClickHouse Database** - Fast analytical database for blockchain data
+2. **Shovels** - Python services that scrape and index specific types of blockchain data
+3. **Shared Libraries** - Common functionality for database connections, substrate interaction, etc.
+
+### How Shovels Work
+
+Each shovel is responsible for:
+
+- Scraping a specific class of blockchain data
+- Processing it block by block
+- Storing it efficiently in ClickHouse
+- Maintaining checkpoints for reliability
+
+The `ShovelBaseClass` handles:
+
+- ✅ Walking through historical blocks
+- ✅ Keeping up with new finalized blocks
+- ✅ Checkpointing progress
+- ✅ Batch inserting data for performance
+- ✅ Error handling and retries
+
+## 🔧 Development
+
+### Development Mode Features
+
+- **🔄 Live Code Reloading** - Edit Python files and see changes instantly
+- **📁 Volume Mounting** - Your local code is mounted into containers
+- **⚡ Fast Iteration** - No rebuilding needed for code changes
+- **🐛 Easy Debugging** - Direct file editing with immediate feedback
+
+### Creating a New Shovel
+
+1. **Create the service directory:**
+
+```bash
+mkdir scraper_service/shovel_my_data
+cd scraper_service/shovel_my_data
+```
+
+2. **Create your shovel class:**
 
 ```python
-class EventsShovel(ShovelBaseClass):
-    def process_block(self, n):
-        do_process_block(n)
+# main.py
+from shared.base import ShovelBaseClass
 
+class MyDataShovel(ShovelBaseClass):
+    def process_block(self, block_number):
+        """Process a single block - implement your logic here"""
+        # 1. Scrape data from blockchain using substrate client
+        substrate = self.get_substrate_client()
+        block_data = substrate.get_block(block_number)
+
+        # 2. Transform the data
+        processed_data = self.transform_data(block_data)
+
+        # 3. Store in ClickHouse using batch insert
+        self.buffer_insert('my_table', processed_data)
+
+    def transform_data(self, block_data):
+        """Transform raw blockchain data into your desired format"""
+        return [{"block": block_data.number, "data": "..."}]
 
 def main():
-    EventsShovel(name="events").start()
-
-def do_process_block(n):
-    # Put all your block processing logic here.
-
-    # e.g.
-    # 1. Scrape data from blockchain
-    # 2. Transform it
-    # 3. Call `buffer_insert` to get it into Clickhouse
+    MyDataShovel(name="my_data").start()
 
 if __name__ == "__main__":
     main()
 ```
 
-`ShovelBaseClass` contains all the logic for ensuring your `process_block` method is called for every block since genesis, and checkpointing progress so it is not lost when the shovel restarts.
+3. **Add to docker-compose.yml:**
 
-3. Add your new shovel to the `docker-compose.yml`
-4. That's it!
+```yaml
+shovel_my_data:
+  <<: *shovel-service
+  build:
+    context: ./scraper_service
+    dockerfile: ./Dockerfile
+    args:
+      SERVICE_NAME: shovel_my_data
+  container_name: shovel_my_data
+```
+
+4. **Add to docker-compose.override.yml** (for development):
+
+```yaml
+shovel_my_data:
+  volumes:
+    - ./scraper_service/shared:/app/shared
+    - ./scraper_service/shovel_my_data:/app/shovel_my_data
+```
+
+5. **Start your new shovel:**
+
+```bash
+make run
+# or start just your service:
+docker compose up -d shovel_my_data
+```
 
 ### Interacting with Substrate
 
-- Inside your shovel, `import from shared.substrate import get_substrate_client` then call `get_substrate_client()` whenever your want a `SubstrateInterface` instance. It implements the singleton pattern, so is only implemented once and reused.
+```python
+from shared.substrate import get_substrate_client
 
-### Interacting with Clickhouse
+# Get singleton substrate client
+substrate = get_substrate_client()
 
-- Do not manually make INSERT queries for Clickhouse. Instead, `from shared.clickhouse.batch_insert import buffer_insert` and call `buffer_insert` with the table and a list of rows you want to insert. The `ShovelBaseClass` will handle periodically flushing the buffer, which is much faster and more efficient than inserting row by row.
+# Use it for blockchain queries
+block = substrate.get_block(block_number)
+events = substrate.get_events(block_number)
+```
 
-## TODO
+### Interacting with ClickHouse
 
-- [ ] Implement proper logging
-- [ ] Observability and alerting
+**Always use batch inserts for performance:**
 
-## Dependencies
+```python
+from shared.clickhouse.batch_insert import buffer_insert
 
-- Docker
+# Buffer data for batch insertion (much faster)
+rows = [
+    {"block_number": 1000, "data": "value1"},
+    {"block_number": 1001, "data": "value2"},
+]
+buffer_insert('my_table', rows)
 
-## Usage
+# The ShovelBaseClass automatically flushes buffers periodically
+```
 
-1. Configure `.env`
+## 🐳 Docker Architecture
+
+### Centralized Dockerfile
+
+All services now use a single, parameterized Dockerfile at `scraper_service/Dockerfile` with:
+
+- Optimized layer caching
+- Shared dependency installation
+- Service-specific code copying via build args
+- Environment variable support for runtime
+
+### Development vs Production
+
+- **Development**: Uses `docker-compose.override.yml` for volume mounting
+- **Production**: Uses copied code in containers for better performance
+
+## 📁 Project Structure
 
 ```
+subtensor-indexer/
+├── docker-compose.yml          # Main service definitions
+├── docker-compose.override.yml # Development overrides (volume mounting)
+├── Makefile                    # Easy development commands
+├── .env                        # Environment configuration
+├── scraper_service/
+│   ├── Dockerfile              # Centralized container definition
+│   ├── Dockerfile.validators   # Special Dockerfile for Rust services
+│   ├── .dockerignore          # Docker build optimization
+│   ├── requirements.txt        # Python dependencies
+│   ├── shared/                 # Common libraries
+│   │   ├── base.py            # ShovelBaseClass
+│   │   ├── substrate.py       # Blockchain interaction
+│   │   └── clickhouse/        # Database utilities
+│   ├── shovel_events/         # Event indexing service
+│   ├── shovel_extrinsics/     # Extrinsic indexing service
+│   ├── shovel_validators/     # Validator data service
+│   └── ...                    # Other shovels
+└── scripts/                   # Build and utility scripts
+```
+
+## 🔧 Configuration
+
+Create your `.env` file:
+
+```bash
 cp .env.example .env
-vi .env
 ```
 
-2. Start Clickhouse and all the shovels
+Key configuration options:
 
+- Database connection settings
+- Substrate node endpoints
+- Service-specific parameters
+
+## 🚨 Troubleshooting
+
+### Services can't find main.py
+
+**Fixed!** The centralized Dockerfile now properly handles service names as environment variables.
+
+### Rust Bindings Issues
+
+If you encounter Rust compilation issues with the validators service:
+
+1. The project uses a special `Dockerfile.validators` for Rust requirements
+2. Check the validators service logs for specific error messages
+
+### Code Changes Not Reflected
+
+Make sure you're running in development mode:
+
+```bash
+make run  # This uses development mode with volume mounting
 ```
-docker compose up --build
+
+If still not working:
+
+```bash
+# Restart specific service
+docker compose restart shovel_my_service
 ```
 
-## Common Issues
+### Performance Issues
 
-### Rust Bindings don't work when started in Docker
+- Use `buffer_insert()` instead of direct database inserts
+- Check ClickHouse query performance with `EXPLAIN` statements
+- Monitor container resources with `docker stats`
 
-Comment out
+## 🎯 Production Deployment
 
+For production, disable the development override:
+
+```bash
+# Build production images
+make build
+
+# Start without development volumes
+docker compose -f docker-compose.yml up -d
 ```
-# Build and cache Rust deps
-# COPY ./shovel_subnets/rust_bindings/Cargo.toml /app/rust_bindings/Cargo.toml
-# COPY ./shovel_subnets/rust_bindings/Cargo.lock /app/rust_bindings/Cargo.lock
-# COPY ./shovel_subnets/rust_bindings/pyproject.toml /app/rust_bindings/pyproject.toml
-# WORKDIR /app/rust_bindings
-# RUN mkdir src && echo "fn main() {}" > src/lib.rs
-# RUN cargo fetch
-# RUN maturin build --release
-# RUN rm src/lib.rs
-# RUN rm /app/rust_bindings/target/wheels/*
-```
 
-from the Dockerfile of the problematic shovel, build the image, and then uncomment it again.
+## 📊 Monitoring
+
+- View all logs: `make logs`
+- Check service health: `make health`
+- Monitor specific service: `make logs SERVICE=shovel_events`
+- ClickHouse interface: http://localhost:8123
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes using development mode: `make run`
+4. Test your changes work correctly
+5. Submit a pull request
+
+## 📝 TODO
+
+- [ ] Implement proper logging framework
+- [ ] Add observability and alerting
+- [ ] Performance monitoring dashboard
+- [ ] Automated testing pipeline
+- [ ] Production deployment guides
+
+## 🛠️ Dependencies
+
+- Docker & Docker Compose
+- Python 3.12+ (in containers)
+- ClickHouse (containerized)
+
+No local Python installation required - everything runs in containers!
