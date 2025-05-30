@@ -1,0 +1,55 @@
+services:
+  shovel_block_timestamp:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_block_timestamp:/app/shovel_block_timestamp
+
+  shovel_extrinsics:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_extrinsics:/app/shovel_extrinsics
+
+  shovel_events:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_events:/app/shovel_events
+
+  shovel_stake_map:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_stake_map:/app/shovel_stake_map
+
+  shovel_hotkey_owner_map:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_hotkey_owner_map:/app/shovel_hotkey_owner_map
+
+  shovel_subnets:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_subnets:/app/shovel_subnets
+
+  shovel_daily_stake:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_daily_stake:/app/shovel_daily_stake
+
+  shovel_daily_balance:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_daily_balance:/app/shovel_daily_balance
+
+  shovel_tao_price:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_tao_price:/app/shovel_tao_price
+
+  shovel_alpha_to_tao:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_alpha_to_tao:/app/shovel_alpha_to_tao
+
+  shovel_validators:
+    volumes:
+      - ./scraper_service/shared:/app/shared
+      - ./scraper_service/shovel_validators:/app/shovel_validators
