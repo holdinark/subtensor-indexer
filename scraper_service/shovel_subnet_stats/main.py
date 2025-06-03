@@ -1,6 +1,6 @@
 from shared.clickhouse.batch_insert import buffer_insert
 from shared.shovel_base_class import ShovelBaseClass
-from shared.substrate import get_substrate_client
+from substrate import get_substrate_client
 from shared.clickhouse.utils import (
     get_clickhouse_client,
     table_exists,
@@ -9,6 +9,7 @@ from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 from shared.block_metadata import get_block_metadata
 import logging
 
+BLOCKS_PER_10MIN = 10 * 60 / 12
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(process)d %(message)s")
@@ -21,6 +22,8 @@ class SubnetStatsShovel(ShovelBaseClass):
         self.starting_block = 4920351
 
     def process_block(self, n):
+        if n % BLOCKS_PER_10MIN != 0:
+            return
         do_process_block(self, n)
 
 
@@ -64,46 +67,53 @@ def do_process_block(self, n):
             raise ShovelProcessingError(f"Failed to get block metadata: {str(e)}")
 
         try:
-            # Get list of active subnets
-            networks_added = substrate.query_map(
-                'SubtensorModule',
-                'NetworksAdded',
+            result = substrate.runtime_call(
+                api="SubnetInfoRuntimeApi",
+                method="get_all_dynamic_info",
+                params=[],
                 block_hash=block_hash
             )
-            networks = [int(net[0].value) for net in networks_added]
+            subnet_info = result.value
 
-            # Process each subnet
-            for netuid in networks:
-                subnet_tao = substrate.query(
-                    'SubtensorModule',
-                    'SubnetTAO',
-                    [netuid],
-                    block_hash=block_hash
-                ).value / 1e9
+            for subnet_data in subnet_info:
+                netuid = subnet_data['netuid']
 
-                subnet_alpha_in = substrate.query(
-                    'SubtensorModule',
-                    'SubnetAlphaIn',
-                    [netuid],
-                    block_hash=block_hash
-                ).value / 1e9
+                alpha_in = subnet_data['alpha_in']
+                alpha_out = subnet_data['alpha_out']
+                tao_in = subnet_data['tao_in']
 
-                # Calculate exchange rate (TAO per Alpha)
-                alpha_to_tao = 1 if netuid == 0 else (subnet_tao / subnet_alpha_in if subnet_alpha_in > 0 else 0)
+                price = 1 if netuid == 0 else (tao_in / alpha_in if alpha_in > 0 else 0)
+
+                market_cap = (alpha_out + alpha_in) * price
 
                 buffer_insert(
                     self.table_name,
-                    [n, block_timestamp, netuid, alpha_to_tao]
+                    [
+                        n,
+                        block_timestamp,
+                        netuid,
+                        subnet_data['tempo'],
+                        subnet_data['emission'],
+                        alpha_in,
+                        alpha_out,
+                        tao_in,
+                        subnet_data['alpha_out_emission'],
+                        subnet_data['alpha_in_emission'],
+                        subnet_data['tao_in_emission'],
+                        subnet_data['pending_alpha_emission'],
+                        subnet_data['pending_root_emission'],
+                        subnet_data['subnet_volume'],
+                        int(price * 1e9),
+                        int(market_cap)
+                    ]
                 )
 
         except Exception as e:
             raise DatabaseConnectionError(f"Failed to insert data into buffer: {str(e)}")
 
     except (DatabaseConnectionError, ShovelProcessingError):
-        # Re-raise these exceptions to be handled by the base class
         raise
     except Exception as e:
-        # Convert unexpected exceptions to ShovelProcessingError
         raise ShovelProcessingError(f"Unexpected error processing block {n}: {str(e)}")
 
 
