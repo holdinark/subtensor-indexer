@@ -50,7 +50,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(process)d %(message)s")
 
 BLOCKS_PER_DAY = 7200
-FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5103999
+FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5004000
 
 class StakeDailyMapShovel(ShovelBaseClass):
     table_name = "shovel_stake_daily_map"
