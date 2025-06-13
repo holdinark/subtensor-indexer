@@ -1,5 +1,4 @@
 import logging
-from decimal import Decimal, getcontext
 
 from shared.block_metadata import get_block_metadata
 from shared.clickhouse.batch_insert import buffer_insert
@@ -14,8 +13,6 @@ logging.basicConfig(level=logging.INFO,
 
 BLOCKS_PER_DAY = 7200
 FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5004000
-
-getcontext().prec = 50
 
 class StakeDailyMapShovel(ShovelBaseClass):
     table_name = "shovel_stake_daily_map"
@@ -126,6 +123,8 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
         active_subnets = substrate.query_map('SubtensorModule', 'NetworksAdded', block_hash=block_hash)
         netuids = [_extract_int(net[0]) for net in active_subnets]
 
+        print(f"Active subnets amount: {len(netuids)}")
+
         # Full StakingHotkeys map (coldkey -> Vec<hotkey>)
         staking_entries_q = substrate.query_map(
             module='SubtensorModule',
@@ -134,6 +133,9 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
             page_size=1000
         )
         staking_entries = list(staking_entries_q)
+
+        print(f"Staking entries amount: {len(staking_entries)}")
+
         if len(staking_entries) == 0:
             raise ShovelProcessingError('No StakingHotkeys data returned')
 
