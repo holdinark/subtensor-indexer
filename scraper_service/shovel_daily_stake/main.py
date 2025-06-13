@@ -181,7 +181,6 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
                     for netuid in netuids:
                         alpha_share_float = _query_fixed_float(substrate, 'Alpha', [hotkey_ss58, coldkey_ss58, netuid], block_hash)
                         if alpha_share_float == 0:
-                            print(f"Alpha share float is 0: {alpha_share_float}")
                             continue
                         hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics(netuid, hotkey_ss58)
                         if total_hotkey_shares_float == 0:
