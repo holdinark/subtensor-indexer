@@ -164,6 +164,7 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
                 hotkeys_raw_list = entry[1]
                 coldkey_ss58 = to_ss58(coldkey_raw, 'coldkey')
                 if not coldkey_ss58 or not hotkeys_raw_list:
+                    print(f"Coldkey or hotkeys raw list is None: {coldkey_raw} {hotkeys_raw_list}")
                     continue
                 if hasattr(hotkeys_raw_list, 'value'):
                     hotkeys_raw_list = hotkeys_raw_list.value
@@ -174,14 +175,17 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
                         hotkey_raw = hotkey_raw[0]
                     hotkey_ss58 = to_ss58(hotkey_raw, 'hotkey')
                     if not hotkey_ss58:
+                        print(f"Hotkey ss58 is None: {hotkey_raw}")
                         continue
 
                     for netuid in netuids:
                         alpha_share_float = _query_fixed_float(substrate, 'Alpha', [hotkey_ss58, coldkey_ss58, netuid], block_hash)
                         if alpha_share_float == 0:
+                            print(f"Alpha share float is 0: {alpha_share_float}")
                             continue
                         hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics(netuid, hotkey_ss58)
                         if total_hotkey_shares_float == 0:
+                            print(f"Total hotkey shares float is 0: {total_hotkey_shares_float}")
                             continue
                         stake_tao = int(alpha_share_float * hotkey_alpha_int / total_hotkey_shares_float)
                         alpha_int = int(alpha_share_float)
