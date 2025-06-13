@@ -1,10 +1,11 @@
 import logging
+import time
 
 from shared.block_metadata import get_block_metadata
 from shared.clickhouse.batch_insert import buffer_insert
 from shared.clickhouse.utils import get_clickhouse_client, table_exists
 from shared.shovel_base_class import ShovelBaseClass
-from substrate import get_substrate_client
+from substrate import get_substrate_client, reconnect_substrate
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 from shared.utils import convert_address_to_ss58
 
@@ -13,6 +14,21 @@ logging.basicConfig(level=logging.INFO,
 
 BLOCKS_PER_DAY = 7200
 FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5004000
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 2  # seconds
+
+def _retry_on_disconnect(func, *args, **kwargs):
+    """Call substrate function with automatic reconnect on Broken pipe / connection reset."""
+    for attempt in range(MAX_RETRIES):
+        try:
+            return func(*args, **kwargs)
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            logging.warning(f"Substrate connection error ({e}); reconnecting (attempt {attempt+1}/{MAX_RETRIES})…")
+            reconnect_substrate()
+            time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+        except Exception:
+            raise
+    raise ShovelProcessingError(f"Failed after {MAX_RETRIES} reconnect attempts")
 
 class StakeDailyMapShovel(ShovelBaseClass):
     table_name = "shovel_stake_daily_map"
@@ -49,7 +65,7 @@ def do_process_block(n, table_name):
             raise DatabaseConnectionError(f"Failed to create/check table: {str(e)}")
 
         try:
-            (block_timestamp, block_hash) = get_block_metadata(n)
+            (block_timestamp, block_hash) = _retry_on_disconnect(get_block_metadata, n)
         except Exception as e:
             raise ShovelProcessingError(f"Failed to get block metadata: {str(e)}")
 
@@ -98,7 +114,7 @@ def _fixed128_to_float(bits_int: int) -> float:
 
 
 def _query_int(substrate, func, params, block_hash):
-    res = substrate.query(
+    res = _retry_on_disconnect(substrate.query,
         'SubtensorModule',
         func,
         params,
@@ -120,17 +136,18 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
         # Cache: per (netuid, hotkey) -> (hotkey_alpha_int, total_hotkey_shares_float)
         hotkey_metrics_cache = {}
 
-        active_subnets = substrate.query_map('SubtensorModule', 'NetworksAdded', block_hash=block_hash)
+        active_subnets = _retry_on_disconnect(substrate.query_map, 'SubtensorModule', 'NetworksAdded', block_hash=block_hash)
         netuids = [_extract_int(net[0]) for net in active_subnets]
 
         print(f"Active subnets amount: {len(netuids)}")
 
         # Full StakingHotkeys map (coldkey -> Vec<hotkey>)
-        staking_entries_q = substrate.query_map(
+        staking_entries_q = _retry_on_disconnect(
+            substrate.query_map,
             module='SubtensorModule',
             storage_function='StakingHotkeys',
             block_hash=block_hash,
-            page_size=1000
+            page_size=1000,
         )
         staking_entries = list(staking_entries_q)
 
@@ -164,7 +181,6 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
                 hotkeys_raw_list = entry[1]
                 coldkey_ss58 = to_ss58(coldkey_raw, 'coldkey')
                 if not coldkey_ss58 or not hotkeys_raw_list:
-                    print(f"Coldkey or hotkeys raw list is None: {coldkey_raw} {hotkeys_raw_list}")
                     continue
                 if hasattr(hotkeys_raw_list, 'value'):
                     hotkeys_raw_list = hotkeys_raw_list.value
