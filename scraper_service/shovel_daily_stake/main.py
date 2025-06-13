@@ -15,7 +15,6 @@ logging.basicConfig(level=logging.INFO,
 BLOCKS_PER_DAY = 7200
 FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5004000
 
-# Increase precision for fixed point operations
 getcontext().prec = 50
 
 class StakeDailyMapShovel(ShovelBaseClass):
@@ -58,21 +57,12 @@ def do_process_block(n, table_name):
             raise ShovelProcessingError(f"Failed to get block metadata: {str(e)}")
 
         try:
-            stake_data = fetch_all_stakes_at_block(block_hash)
+            rows_inserted = fetch_all_stakes_at_block(block_hash, n, block_timestamp, table_name)
         except Exception as e:
             raise ShovelProcessingError(f"Failed to fetch stakes from substrate: {str(e)}")
 
-        if not stake_data:
+        if rows_inserted == 0:
             raise ShovelProcessingError(f"No stake data returned for block {n}")
-
-        try:
-            for stake_entry in stake_data:
-                buffer_insert(
-                    table_name,
-                    [n, block_timestamp, f"'{stake_entry['coldkey']}'", f"'{stake_entry['hotkey']}'", stake_entry['netuid'], stake_entry['stake'], stake_entry['alpha']]
-                )
-        except Exception as e:
-            raise DatabaseConnectionError(f"Failed to insert data into buffer: {str(e)}")
 
     except (DatabaseConnectionError, ShovelProcessingError):
         # Re-raise these exceptions to be handled by the base class
@@ -125,17 +115,16 @@ def _query_fixed_float(substrate, func, params, block_hash):
     return _fixed128_to_float(bits)
 
 
-def fetch_all_stakes_at_block(block_hash):
-    """Compute TAO stake and Alpha share for all coldkeys using only storage maps (no runtime calls)."""
+def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_name):
+    """Stream stakes from chain and insert directly into ClickHouse buffer, return rows inserted."""
     try:
         substrate = get_substrate_client()
 
         # Cache: per (netuid, hotkey) -> (hotkey_alpha_int, total_hotkey_shares_float)
         hotkey_metrics_cache = {}
 
-        # Active subnets
-        networks_added = substrate.query_map('SubtensorModule', 'NetworksAdded', block_hash=block_hash)
-        netuids = [_extract_int(net[0]) for net in networks_added]
+        active_subnets = substrate.query_map('SubtensorModule', 'NetworksAdded', block_hash=block_hash)
+        netuids = [_extract_int(net[0]) for net in active_subnets]
 
         # Full StakingHotkeys map (coldkey -> Vec<hotkey>)
         staking_entries_q = substrate.query_map(
@@ -148,9 +137,8 @@ def fetch_all_stakes_at_block(block_hash):
         if len(staking_entries) == 0:
             raise ShovelProcessingError('No StakingHotkeys data returned')
 
-        all_stakes = []
+        rows_inserted = 0
 
-        # Helper to convert Scale bytes/tuple to SS58 using shared utils
         def to_ss58(raw_addr, addr_type):
             try:
                 return convert_address_to_ss58(raw_addr, addr_type)
@@ -168,19 +156,17 @@ def fetch_all_stakes_at_block(block_hash):
 
         for idx, entry in enumerate(staking_entries):
             if idx % 1000 == 0:
-                logging.debug(f'Processing StakingHotkeys entry {idx+1}/{len(staking_entries)}')
+                logging.debug(f'Streaming StakingHotkeys entry {idx+1}/{len(staking_entries)}')
             try:
                 coldkey_raw = entry[0]
                 hotkeys_raw_list = entry[1]
                 coldkey_ss58 = to_ss58(coldkey_raw, 'coldkey')
                 if not coldkey_ss58 or not hotkeys_raw_list:
                     continue
-                # Unwrap BittensorScaleType value attribute
                 if hasattr(hotkeys_raw_list, 'value'):
                     hotkeys_raw_list = hotkeys_raw_list.value
 
                 for hotkey_raw_container in hotkeys_raw_list:
-                    # handle nested tuple ((bytes,),) or direct tuple
                     hotkey_raw = hotkey_raw_container
                     if isinstance(hotkey_raw, (tuple, list)) and len(hotkey_raw) == 1 and isinstance(hotkey_raw[0], (tuple, list)):
                         hotkey_raw = hotkey_raw[0]
@@ -189,29 +175,32 @@ def fetch_all_stakes_at_block(block_hash):
                         continue
 
                     for netuid in netuids:
-                        # Alpha share (fixed 128) between this coldkey/hotkey on subnet
                         alpha_share_float = _query_fixed_float(substrate, 'Alpha', [hotkey_ss58, coldkey_ss58, netuid], block_hash)
                         if alpha_share_float == 0:
-                            continue  # coldkey not staked to this hotkey in this subnet
-
+                            continue
                         hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics(netuid, hotkey_ss58)
                         if total_hotkey_shares_float == 0:
                             continue
                         stake_tao = int(alpha_share_float * hotkey_alpha_int / total_hotkey_shares_float)
                         alpha_int = int(alpha_share_float)
 
-                        all_stakes.append({
-                            'coldkey': coldkey_ss58,
-                            'hotkey': hotkey_ss58,
-                            'netuid': netuid,
-                            'stake': stake_tao,
-                            'alpha': alpha_int
-                        })
+                        buffer_insert(
+                            table_name,
+                            [
+                                block_number,
+                                block_timestamp,
+                                f"'{coldkey_ss58}'",
+                                f"'{hotkey_ss58}'",
+                                netuid,
+                                stake_tao,
+                                alpha_int,
+                            ],
+                        )
+                        rows_inserted += 1
             except Exception as exc:
-                logging.warning(f'Error processing staking entry #{idx}: {exc}')
+                logging.warning(f'Error streaming staking entry #{idx}: {exc}')
                 continue
-
-        return all_stakes
+        return rows_inserted
 
     except Exception as e:
         raise ShovelProcessingError(f'Error fetching stakes: {str(e)}')
