@@ -9,8 +9,19 @@ from substrate import get_substrate_client, reconnect_substrate
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 from shared.utils import convert_address_to_ss58
 
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(process)d %(message)s")
+logging.basicConfig(level=logging.DEBUG,
+                    format="%(asctime)s %(levelname)s %(process)d %(message)s")
+
+# Mute very verbose third-party libraries; keep our DEBUG statements visible.
+for noisy in (
+    "substrateinterface",
+    "websockets",
+    "websocket",
+    "websocket-client",
+    "clickhouse_driver",
+    "urllib3",
+):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 BLOCKS_PER_DAY = 7200
 FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5004000
@@ -35,6 +46,7 @@ class StakeDailyMapShovel(ShovelBaseClass):
 
     def __init__(self, name):
         super().__init__(name)
+        print(f"starting new shovel version ")
         self.starting_block = FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM
 
     def process_block(self, n):
@@ -42,6 +54,8 @@ class StakeDailyMapShovel(ShovelBaseClass):
 
 
 def do_process_block(n, table_name):
+    if n < FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM:
+        return
     if n % BLOCKS_PER_DAY != 0:
         return
     try:
@@ -131,17 +145,29 @@ def _query_fixed_float(substrate, func, params, block_hash):
 def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_name):
     """Stream stakes from chain and insert directly into ClickHouse buffer, return rows inserted."""
     try:
+        block_start_time = time.time()
+        logging.info(f"Block {block_number}: starting stake snapshot")
         substrate = get_substrate_client()
 
         # Cache: per (netuid, hotkey) -> (hotkey_alpha_int, total_hotkey_shares_float)
         hotkey_metrics_cache = {}
 
-        active_subnets = _retry_on_disconnect(substrate.query_map, 'SubtensorModule', 'NetworksAdded', block_hash=block_hash)
+        t0 = time.time()
+        active_subnets = _retry_on_disconnect(
+            substrate.query_map,
+            'SubtensorModule',
+            'NetworksAdded',
+            block_hash=block_hash,
+        )
+        t1 = time.time()
         netuids = [_extract_int(net[0]) for net in active_subnets]
 
-        print(f"Active subnets amount: {len(netuids)}")
+        logging.debug(
+            f"Block {block_number}: fetched {len(netuids)} active subnets in {t1 - t0:.2f}s"
+        )
 
         # Full StakingHotkeys map (coldkey -> Vec<hotkey>)
+        t2 = time.time()
         staking_entries_q = _retry_on_disconnect(
             substrate.query_map,
             module='SubtensorModule',
@@ -150,8 +176,11 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
             page_size=1000,
         )
         staking_entries = list(staking_entries_q)
+        t3 = time.time()
 
-        print(f"Staking entries amount: {len(staking_entries)}")
+        logging.debug(
+            f"Block {block_number}: fetched {len(staking_entries)} StakingHotkeys entries in {t3 - t2:.2f}s"
+        )
 
         if len(staking_entries) == 0:
             raise ShovelProcessingError('No StakingHotkeys data returned')
@@ -195,6 +224,7 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
                         continue
 
                     for netuid in netuids:
+                        hotkey_process_start = time.time()
                         alpha_share_float = _query_fixed_float(substrate, 'Alpha', [hotkey_ss58, coldkey_ss58, netuid], block_hash)
                         if alpha_share_float == 0:
                             continue
@@ -218,9 +248,17 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
                             ],
                         )
                         rows_inserted += 1
+                        hotkey_elapsed = time.time() - hotkey_process_start
+                        logging.debug(
+                            f"Block {block_number}: processed hotkey {hotkey_ss58} (netuid {netuid}) in {hotkey_elapsed:.3f}s"
+                        )
             except Exception as exc:
                 logging.warning(f'Error streaming staking entry #{idx}: {exc}')
                 continue
+        block_elapsed = time.time() - block_start_time
+        logging.info(
+            f"Block {block_number}: inserted {rows_inserted} rows in {block_elapsed:.2f}s"
+        )
         return rows_inserted
 
     except Exception as e:
