@@ -8,6 +8,14 @@ from queue import Queue
 # Thread-local storage for substrate clients
 thread_local = threading.local()
 
+# ---------------------------------------------------------------------------
+# Default connection-pool size. Can be overridden via env var SUBSTRATE_POOL_SIZE.
+# We now keep it aligned with HOTKEY_POOL_SIZE (defaults to 50) to avoid creating
+# excessive websocket connections at startup.
+# ---------------------------------------------------------------------------
+
+DEFAULT_POOL_SIZE = int(os.getenv("SUBSTRATE_POOL_SIZE", "32"))
+
 def get_substrate_client():
     """Get a substrate client for the current thread."""
     if not hasattr(thread_local, "client"):
@@ -80,7 +88,7 @@ class LazySubstrateConnection:
 class SubstrateConnectionPool:
     """Pre-create connections to avoid serial connection setup."""
     
-    def __init__(self, size=12):
+    def __init__(self, size: int = DEFAULT_POOL_SIZE):
         self.size = size
         self.connections = Queue()
         self.url = os.getenv("SUBSTRATE_ARCHIVE_NODE_URL")
@@ -156,7 +164,7 @@ class SubstrateConnectionPool:
 class SimpleSubstrateConnectionPool:
     """Simpler pool that creates basic connections only."""
     
-    def __init__(self, size=12):
+    def __init__(self, size: int = DEFAULT_POOL_SIZE):
         self.size = size
         self.connections = Queue()
         self.url = os.getenv("SUBSTRATE_ARCHIVE_NODE_URL")
@@ -191,12 +199,17 @@ class SimpleSubstrateConnectionPool:
 # Global pool instance
 _pool = None
 
-def get_pool(block_hash=None, use_lazy=True):
+# ---------------------------------------------------------------------------
+# Public helper to obtain the global pool. If size is not explicitly provided
+# we fall back to `DEFAULT_POOL_SIZE`.
+# ---------------------------------------------------------------------------
+
+def get_pool(block_hash=None, use_lazy=True, size: int = DEFAULT_POOL_SIZE):
     global _pool
     if _pool is None:
         if use_lazy:
-            _pool = SubstrateConnectionPool()
+            _pool = SubstrateConnectionPool(size=size)
         else:
-            _pool = SimpleSubstrateConnectionPool()
+            _pool = SimpleSubstrateConnectionPool(size=size)
         _pool.initialize(block_hash)
     return _pool

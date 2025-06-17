@@ -10,10 +10,12 @@ from shared.block_metadata import get_block_metadata
 from shared.clickhouse.batch_insert import buffer_insert
 from shared.clickhouse.utils import get_clickhouse_client, table_exists
 from shared.shovel_base_class import ShovelBaseClass
-from substrate import get_substrate_client, reconnect_substrate
+from substrate import get_substrate_client, reconnect_substrate, get_pool
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 from shared.utils import convert_address_to_ss58
 from hotkeys import _fetch_staking_hotkeys_parallel_pooled
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 logging.basicConfig(level=logging.DEBUG,
                     format="%(asctime)s %(levelname)s %(process)d %(message)s")
@@ -200,459 +202,624 @@ def _query_fixed_float(substrate, func, params, block_hash):
     return _fixed128_to_float(bits)
 
 
-def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_name):
-    """Stream stakes from chain and insert directly into ClickHouse buffer, return rows inserted."""
-    try:
-        block_start_time = time.time()
-        logging.info(f"Block {block_number}: starting stake snapshot")
-        substrate = get_substrate_client()
+# Global hotkey processing pool
 
-        # Cache: per (netuid, hotkey) -> (hotkey_alpha_int, total_hotkey_shares_float)
-        hotkey_metrics_cache = {}
 
-        t0 = time.time()
-        active_subnets = _retry_on_disconnect(
-            substrate.query_map,
-            'SubtensorModule',
-            'NetworksAdded',
-            block_hash=block_hash,
-        )
-        t1 = time.time()
-        netuids = [_extract_int(net[0]) for net in active_subnets]
+# Global hotkey processing pool
+HOTKEY_POOL_SIZE = 32  # Align with connection pool size
 
-        logging.debug(
-            f"Block {block_number}: fetched {len(netuids)} active subnets in {t1 - t0:.2f}s"
-        )
+# --- concurrency + progress tracking --------------------------------------
+concurrent_tasks = 0
+concurrent_lock = threading.Lock()
 
-        # -------------------------------------------------------------------
-        # Fetch or reuse the StakingHotkeys map (coldkey -> Vec<hotkey>)
-        # -------------------------------------------------------------------
-        if (
-            _staking_hotkeys_cache["entries"] is not None
-            and _staking_hotkeys_cache["block_hash"] is not None
-            and (block_number - _extract_int(substrate.get_block_number(_staking_hotkeys_cache["block_hash"]))) < CACHE_REFRESH_INTERVAL
-        ):
-            staking_entries = _staking_hotkeys_cache["entries"]
-            logging.info(
-                f"Block {block_number}: cache hit → reused StakingHotkeys snapshot (≈{len(staking_entries)} entries); skipping on-chain download altogether"
-            )
+# Completed hotkey-subnet tasks (for user-visible progress logging)
+processed_hotkey_tasks = 0
+processed_hotkey_tasks_lock = threading.Lock()
+
+# Count of hotkey tasks that have been submitted to executors so far
+submitted_hotkey_tasks = 0
+submitted_hotkey_tasks_lock = threading.Lock()
+
+# Semaphore to cap the true parallel hotkey RPC queries **across the whole process**
+hotkey_query_semaphore = threading.Semaphore(HOTKEY_POOL_SIZE)
+
+import logging
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
+import threading
+import os
+from queue import Queue
+
+# Global progress tracking with more detail
+progress_data = {
+    'total_hotkey_tasks': 0,
+    'completed_hotkey_tasks': 0,
+    'failed_hotkey_tasks': 0,
+    'total_entries': 0,
+    'completed_entries': 0,
+    'start_time': None,
+    'rows_inserted': 0,
+    'last_log_time': 0,
+    'tasks_per_second': []  # Rolling window of completion rates
+}
+progress_lock = threading.Lock()
+
+def update_progress(field, value, increment=True):
+    """Thread-safe progress update."""
+    with progress_lock:
+        if increment:
+            progress_data[field] += value
         else:
-            logging.info(
-                f"Block {block_number}: cache miss → fetching StakingHotkeys map afresh"
-            )
-            t2 = time.time()
+            progress_data[field] = value
+        return progress_data.copy()
 
-            # Compute storage-key prefix for StakingHotkeys once per call
-            staking_prefix = (
-                substrate.create_storage_key(
-                    "SubtensorModule", "StakingHotkeys", []
-                ).to_hex()[2:]
-            )
+def reset_progress_data(start_time):
+    """Reset all progress tracking data."""
+    for key in progress_data:
+        if key == 'tasks_per_second':
+            update_progress(key, [], increment=False)
+        else:
+            update_progress(key, 0, increment=False)
+    update_progress('start_time', start_time, increment=False)
 
-            # If we already have a snapshot, query only the changes
-            if _staking_hotkeys_cache["entries"] is not None:
-                # Measure how long the on-chain diff retrieval takes
-                t_diff_start = time.time()
-                changes = _retry_on_disconnect(
-                    substrate.rpc_request,
-                    "state_queryStorage",
-                    [[f"0x{staking_prefix}"], _staking_hotkeys_cache["block_hash"], block_hash],
-                )
-                t_diff_end = time.time()
-                logging.info(
-                    f"Block {block_number}: fetched StakingHotkeys diff with {len(changes[0])} change-items in {t_diff_end - t_diff_start:.2f}s (incremental update)"
-                )
-
-                # Start from cached snapshot and patch in-place
-                staking_entries = _staking_hotkeys_cache["entries"]
-                key_to_index = {e[0]: idx for idx, e in enumerate(staking_entries)}
-
-                for change in changes[0]:  # single prefix list
-                    key_hex = change[0]
-                    new_value = change[1]
-                    coldkey_raw = bytes.fromhex(key_hex[-64:])
-                    if new_value is None:
-                        # deletion
-                        if coldkey_raw in key_to_index:
-                            del staking_entries[key_to_index[coldkey_raw]]
-                    else:
-                        staking_entries.append((coldkey_raw, new_value))
-
-            else:
-                staking_entries = _fetch_staking_hotkeys_parallel_pooled(
-                    block_hash,
-                    block_number,
-                    page_size=PAGE_SIZE,
-                    fetch_workers=MAX_WORKERS,
-                )
-
-            t3 = time.time()
-
-            # Update cache
-            _staking_hotkeys_cache["entries"] = staking_entries
-            _staking_hotkeys_cache["block_hash"] = block_hash
-
-            logging.debug(
-                f"Block {block_number}: prepared {len(staking_entries)} StakingHotkeys entries in {t3 - t2:.2f}s"
-            )
-
-        if len(staking_entries) == 0:
-            raise ShovelProcessingError('No StakingHotkeys data returned')
-
-        rows_inserted = 0
-
-        # ---------------------- per-thread row tracking --------------------
-        thread_rows_counter = defaultdict(int)
-        thread_elapsed_counter = defaultdict(float)
-        thread_rows_lock = threading.Lock()
+def get_progress_stats():
+    """Get current progress statistics with fixed ETA calculation."""
+    with progress_lock:
+        data = progress_data.copy()
+    
+    if data['total_hotkey_tasks'] > 0:
+        hotkey_pct = (data['completed_hotkey_tasks'] / data['total_hotkey_tasks']) * 100
+    else:
+        hotkey_pct = 0
+    
+    if data['total_entries'] > 0:
+        entry_pct = (data['completed_entries'] / data['total_entries']) * 100
+    else:
+        entry_pct = 0
+    
+    elapsed = time.time() - data['start_time'] if data['start_time'] else 0
+    
+    # Calculate current rate
+    if data['completed_hotkey_tasks'] > 0 and elapsed > 0:
+        overall_rate = data['completed_hotkey_tasks'] / elapsed
         
-        # Progress tracking for entry processing
-        entries_processed = 0
-        entries_progress_lock = threading.Lock()
-        total_entries = len(staking_entries)
-        # -----------------------------------------------------------------
+        # Calculate recent rate from rolling window
+        if data['tasks_per_second'] and len(data['tasks_per_second']) > 2:
+            recent_rates = [r for r in data['tasks_per_second'][-10:] if r > 0]
+            if recent_rates:
+                recent_rate = sum(recent_rates) / len(recent_rates)
+            else:
+                recent_rate = overall_rate
+        else:
+            recent_rate = overall_rate
+        
+        # Use recent rate for ETA if available and reasonable
+        rate = recent_rate if recent_rate > 0 else overall_rate
+        remaining = data['total_hotkey_tasks'] - data['completed_hotkey_tasks']
+        eta_seconds = remaining / rate if rate > 0 else 0
+        
+        # Sanity check on ETA
+        if eta_seconds > 0 and eta_seconds < 86400 * 365:  # Less than a year
+            if eta_seconds > 3600:
+                eta_str = f"{eta_seconds/3600:.1f}h"
+            elif eta_seconds > 60:
+                eta_str = f"{eta_seconds/60:.1f}m"
+            else:
+                eta_str = f"{eta_seconds:.0f}s"
+        else:
+            eta_str = "calculating..."
+    else:
+        eta_str = "calculating..."
+        rate = 0
+        overall_rate = 0
+    
+    return {
+        'hotkey_pct': hotkey_pct,
+        'entry_pct': entry_pct,
+        'elapsed': elapsed,
+        'eta': eta_str,
+        'rate': rate,
+        'overall_rate': overall_rate,
+        'failed': data['failed_hotkey_tasks'],
+        **data
+    }
+def progress_monitor(block_number, stop_event, interval=2.0):
+    """Background thread to monitor and log progress."""
+    last_completed = 0
+    last_time = time.time()
+    
+    while not stop_event.is_set():
+        try:
+            current_time = time.time()
+            stats = get_progress_stats()
+            
+            # Calculate rate for this interval
+            if current_time - last_time > 0:
+                interval_tasks = stats['completed_hotkey_tasks'] - last_completed
+                interval_rate = interval_tasks / (current_time - last_time)
+                
+                # Update rolling window
+                with progress_lock:
+                    progress_data['tasks_per_second'].append(interval_rate)
+                    # Keep only last 20 samples
+                    if len(progress_data['tasks_per_second']) > 20:
+                        progress_data['tasks_per_second'].pop(0)
+            
+            # Always log progress every interval, even if no change
+            if current_time - stats['last_log_time'] >= interval:
+                update_progress('last_log_time', current_time, increment=False)
+                
+                logging.info(
+                    f"Block {block_number} PROGRESS: "
+                    f"Entries: {stats['completed_entries']}/{stats['total_entries']} ({stats['entry_pct']:.1f}%) | "
+                    f"Hotkeys: {stats['completed_hotkey_tasks']}/{stats['total_hotkey_tasks']} ({stats['hotkey_pct']:.1f}%) | "
+                    f"Failed: {stats['failed']} | "
+                    f"Rows: {stats['rows_inserted']} | "
+                    f"Rate: {stats['rate']:.0f} tasks/s (avg: {stats['overall_rate']:.0f}) | "
+                    f"Elapsed: {stats['elapsed']/60:.1f}m | "
+                    f"ETA: {stats['eta']}"
+                )
+                
+                last_completed = stats['completed_hotkey_tasks']
+                last_time = current_time
+            
+        except Exception as e:
+            logging.error(f"Progress monitor error: {e}")
+        
+        time.sleep(min(interval, 0.5))  # Check more frequently but log less often
 
-        def to_ss58(raw_addr, addr_type):
-            """Convert address to SS58 format, handling various input types."""
+def fetch_active_subnets(substrate, block_hash):
+    """Fetch list of active subnet IDs."""
+    t0 = time.time()
+    active_subnets = _retry_on_disconnect(
+        substrate.query_map,
+        'SubtensorModule',
+        'NetworksAdded',
+        block_hash=block_hash,
+    )
+    t1 = time.time()
+    netuids = [_extract_int(net[0]) for net in active_subnets]
+    logging.debug(f"Fetched {len(netuids)} active subnets in {t1 - t0:.2f}s")
+    return netuids
+
+def get_staking_entries(block_number, block_hash, substrate):
+    """Get staking entries either from cache or by fetching."""
+    if (_staking_hotkeys_cache["entries"] is not None and
+        _staking_hotkeys_cache["block_hash"] is not None and
+        (block_number - _extract_int(substrate.get_block_number(_staking_hotkeys_cache["block_hash"]))) < CACHE_REFRESH_INTERVAL):
+        staking_entries = _staking_hotkeys_cache["entries"]
+        logging.info(f"Block {block_number}: cache hit → reused StakingHotkeys snapshot (≈{len(staking_entries)} entries)")
+    else:
+        logging.info(f"Block {block_number}: cache miss → fetching StakingHotkeys map afresh")
+        staking_entries = _fetch_staking_hotkeys_parallel_pooled(
+            block_hash,
+            block_number,
+            page_size=PAGE_SIZE,
+            fetch_workers=MAX_WORKERS,
+        )
+        _staking_hotkeys_cache["entries"] = staking_entries
+        _staking_hotkeys_cache["block_hash"] = block_hash
+    
+    return staking_entries
+
+def calculate_total_work(staking_entries, netuids):
+    """Calculate total number of hotkey tasks."""
+    total_hotkey_tasks = 0
+    valid_entries = 0
+    
+    for entry in staking_entries:
+        coldkey_raw = entry[0]
+        hotkeys_raw_list = entry[1]
+        
+        # Quick validation without full conversion
+        if coldkey_raw is None or hotkeys_raw_list is None:
+            continue
+            
+        if hasattr(hotkeys_raw_list, 'value'):
+            hotkeys_raw_list = hotkeys_raw_list.value
+            
+        if hotkeys_raw_list:
             try:
-                # Handle None/empty cases
-                if raw_addr is None:
+                hotkey_count = len(hotkeys_raw_list)
+                total_hotkey_tasks += hotkey_count * len(netuids)
+                valid_entries += 1
+            except:
+                pass
+                
+    return total_hotkey_tasks, valid_entries
+
+def to_ss58(raw_addr, addr_type):
+    """Convert address to SS58 format, handling various input types."""
+    try:
+        if raw_addr is None:
+            return None
+        
+        if isinstance(raw_addr, str):
+            if raw_addr.startswith('5') and len(raw_addr) >= 47:
+                return raw_addr
+            return None
+        
+        if hasattr(raw_addr, 'value'):
+            value = raw_addr.value
+            if isinstance(value, str) and value.startswith('5') and len(value) >= 47:
+                return value
+            if isinstance(value, bytes):
+                return convert_address_to_ss58(value, addr_type)
+            return None
+        
+        if hasattr(raw_addr, '__str__'):
+            str_val = str(raw_addr)
+            if str_val.startswith('5') and len(str_val) >= 47:
+                return str_val
+        
+        if isinstance(raw_addr, bytes):
+            return convert_address_to_ss58(raw_addr, addr_type)
+        
+        if hasattr(raw_addr, '__iter__') and not isinstance(raw_addr, str):
+            try:
+                byte_data = bytes(raw_addr)
+                return convert_address_to_ss58(byte_data, addr_type)
+            except:
+                pass
+        
+        return None
+        
+    except Exception as e:
+        logging.warning(f"Error converting {addr_type} to SS58: {e}")
+        return None
+
+def get_hotkey_metrics_cached(netuid_local, hotkey_address_local, substrate_conn, 
+                            block_hash, hotkey_metrics_cache, hotkey_metrics_lock):
+    """Get hotkey metrics with caching."""
+    key_local = (netuid_local, hotkey_address_local)
+    
+    with hotkey_metrics_lock:
+        if key_local in hotkey_metrics_cache:
+            return hotkey_metrics_cache[key_local]
+    
+    # Fetch metrics with retry on metadata errors
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            hotkey_alpha_int_local = _query_int(
+                substrate_conn,
+                'TotalHotkeyAlpha',
+                [hotkey_address_local, netuid_local],
+                block_hash,
+            )
+            total_hotkey_shares_float_local = _query_fixed_float(
+                substrate_conn,
+                'TotalHotkeyShares',
+                [hotkey_address_local, netuid_local],
+                block_hash,
+            )
+            
+            result = (hotkey_alpha_int_local, total_hotkey_shares_float_local)
+            
+            with hotkey_metrics_lock:
+                hotkey_metrics_cache[key_local] = result
+            
+            return result
+        except (AttributeError, NotImplementedError) as e:
+            if "metadata" in str(e).lower() and attempt < max_retries - 1:
+                logging.warning(f"Metadata error in metrics cache, retrying...")
+                try:
+                    substrate_conn.init_runtime(block_hash=block_hash)
+                except:
+                    pass
+                time.sleep(0.5)
+            else:
+                raise
+
+def process_single_hotkey_subnet(coldkey_ss58, hotkey_ss58, netuid, substrate_conn, 
+                               block_hash, block_number, block_timestamp,
+                               hotkey_metrics_cache, hotkey_metrics_lock):
+    """Process a single hotkey-subnet combination with better error handling."""
+    global concurrent_tasks
+    
+    # Acquire semaphore to enforce a hard upper-bound on concurrent RPCs
+    hotkey_query_semaphore.acquire()
+    
+    with concurrent_lock:
+        concurrent_tasks += 1
+        current_concurrent = concurrent_tasks
+    
+    thread_name = threading.current_thread().name
+    task_id = f"{hotkey_ss58[:8]}/{netuid}"
+    
+    try:
+        t0 = time.time()
+        logging.debug(
+            f"Block {block_number}: {thread_name} starting {task_id} "
+            f"(concurrent tasks: {current_concurrent})"
+        )
+        
+        # Handle metadata errors with retry
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                # Query Alpha first - if zero, skip expensive queries
+                alpha_share_float = _query_fixed_float(
+                    substrate_conn,
+                    'Alpha',
+                    [hotkey_ss58, coldkey_ss58, netuid],
+                    block_hash,
+                )
+                if alpha_share_float == 0:
                     return None
                 
-                # If it's already a string and looks like SS58, return it
-                if isinstance(raw_addr, str):
-                    if raw_addr.startswith('5') and len(raw_addr) >= 47:  # SS58 format check
-                        return raw_addr
+                hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics_cached(
+                    netuid, hotkey_ss58, substrate_conn, block_hash,
+                    hotkey_metrics_cache, hotkey_metrics_lock
+                )
+                if total_hotkey_shares_float == 0:
                     return None
                 
-                # Handle ScaleType objects (most common case now)
-                if hasattr(raw_addr, 'value'):
-                    value = raw_addr.value
-                    if isinstance(value, str) and value.startswith('5') and len(value) >= 47:
-                        return value
-                    # If value is bytes, try to convert
-                    if isinstance(value, bytes):
-                        return convert_address_to_ss58(value, addr_type)
-                    return None
+                stake_tao = int(alpha_share_float * hotkey_alpha_int / total_hotkey_shares_float)
+                alpha_int = int(alpha_share_float)
                 
-                # Handle direct access to string value (some ScaleType variations)
-                if hasattr(raw_addr, '__str__'):
-                    str_val = str(raw_addr)
-                    if str_val.startswith('5') and len(str_val) >= 47:
-                        return str_val
+                elapsed = time.time() - t0
+                if elapsed > 2.0:
+                    logging.info(
+                        f"Block {block_number}: {thread_name} slow hotkey query {task_id} took {elapsed:.2f}s"
+                    )
+                else:
+                    logging.debug(
+                        f"Block {block_number}: {thread_name} completed {task_id} in {elapsed:.2f}s"
+                    )
                 
-                # Handle bytes (original case)
-                if isinstance(raw_addr, bytes):
-                    return convert_address_to_ss58(raw_addr, addr_type)
+                return [
+                    block_number,
+                    block_timestamp,
+                    f"'{coldkey_ss58}'",
+                    f"'{hotkey_ss58}'",
+                    netuid,
+                    stake_tao,
+                    alpha_int,
+                ]
                 
-                # Handle other iterables that might contain bytes
-                if hasattr(raw_addr, '__iter__') and not isinstance(raw_addr, str):
+            except (AttributeError, NotImplementedError) as e:
+                if "metadata" in str(e).lower() and attempt < max_retries - 1:
+                    logging.warning(f"Metadata error for {task_id}, attempt {attempt + 1}/{max_retries}")
                     try:
-                        # Try to convert to bytes
-                        byte_data = bytes(raw_addr)
-                        return convert_address_to_ss58(byte_data, addr_type)
+                        substrate_conn.init_runtime(block_hash=block_hash)
                     except:
                         pass
-                
-                # Log what we couldn't handle for debugging
-                logging.warning(f"Error converting {addr_type} to SS58: unsupported type {type(raw_addr)}")
-                logging.warning(f"{addr_type} type: {type(raw_addr)}, value: {raw_addr}")
-                return None
-                
-            except Exception as e:
-                # Log the specific error and the problematic data
-                logging.warning(f"Error converting {addr_type} to SS58: {e}")
-                logging.warning(f"{addr_type} type: {type(raw_addr)}, value: {raw_addr}")
-                return None
-
-        def process_entry(entry_idx, entry):
-            nonlocal entries_processed
-            
-            local_rows = 0
-            proc_start = time.time()
-            coldkey_raw = entry[0]
-            hotkeys_raw_list = entry[1]
-            coldkey_ss58 = to_ss58(coldkey_raw, 'coldkey')
-            if not coldkey_ss58 or not hotkeys_raw_list:
-                # Update progress counter even for skipped entries
-                with entries_progress_lock:
-                    entries_processed += 1
-                return 0
-            if hasattr(hotkeys_raw_list, 'value'):
-                hotkeys_raw_list = hotkeys_raw_list.value
-
-            local_substrate = get_substrate_client()
-
-            def get_hotkey_metrics_local(netuid_local, hotkey_address_local):
-                key_local = (netuid_local, hotkey_address_local)
-                if key_local in hotkey_metrics_cache:
-                    return hotkey_metrics_cache[key_local]
-                hotkey_alpha_int_local = _query_int(
-                    local_substrate,
-                    'TotalHotkeyAlpha',
-                    [hotkey_address_local, netuid_local],
-                    block_hash,
-                )
-                total_hotkey_shares_float_local = _query_fixed_float(
-                    local_substrate,
-                    'TotalHotkeyShares',
-                    [hotkey_address_local, netuid_local],
-                    block_hash,
-                )
-                hotkey_metrics_cache[key_local] = (
-                    hotkey_alpha_int_local,
-                    total_hotkey_shares_float_local,
-                )
-                return hotkey_metrics_cache[key_local]
-
-            try:
-                for hotkey_raw_container in hotkeys_raw_list:
-                    hotkey_raw = hotkey_raw_container
-                    if isinstance(hotkey_raw, (tuple, list)) and len(hotkey_raw) == 1 and isinstance(hotkey_raw[0], (tuple, list)):
-                        hotkey_raw = hotkey_raw[0]
-                    hotkey_ss58 = to_ss58(hotkey_raw, 'hotkey')
-                    if not hotkey_ss58:
-                        continue
-
-                    for netuid in netuids:
-                        hotkey_process_start = time.time()
-                        try:
-                            alpha_share_float = _query_fixed_float(
-                                local_substrate,
-                                'Alpha',
-                                [hotkey_ss58, coldkey_ss58, netuid],
-                                block_hash,
-                            )
-                            if alpha_share_float == 0:
-                                continue
-                            hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics_local(
-                                netuid, hotkey_ss58
-                            )
-                            if total_hotkey_shares_float == 0:
-                                continue
-                            stake_tao = int(alpha_share_float * hotkey_alpha_int / total_hotkey_shares_float)
-                            alpha_int = int(alpha_share_float)
-
-                            buffer_insert(
-                                table_name,
-                                [
-                                    block_number,
-                                    block_timestamp,
-                                    f"'{coldkey_ss58}'",
-                                    f"'{hotkey_ss58}'",
-                                    netuid,
-                                    stake_tao,
-                                    alpha_int,
-                                ],
-                            )
-                            local_rows += 1
-                        finally:
-                            # Track per-hotkey timing
-                            hotkey_elapsed = time.time() - hotkey_process_start
-                            # Log slow hotkey queries
-                            if hotkey_elapsed > 2.0:
-                                logging.debug(
-                                    f"Block {block_number}: slow hotkey query {hotkey_ss58[:8]}.../{netuid} took {hotkey_elapsed:.2f}s"
-                                )
-
-                elapsed = time.time() - proc_start
-                
-                # Update progress tracking
-                with entries_progress_lock:
-                    entries_processed += 1
-                    current_progress = entries_processed
+                    time.sleep(0.5 * (attempt + 1))
+                else:
+                    raise
                     
-                # Log progress every 1000 entries or if processing is slow
-                if current_progress % 1000 == 0 or elapsed > 5.0:
-                    progress_pct = (current_progress / total_entries) * 100
-                    logging.info(
-                        f"Block {block_number}: processed entry {current_progress}/{total_entries} "
-                        f"({progress_pct:.1f}%) - coldkey {coldkey_ss58[:8]}... in {elapsed:.2f}s, "
-                        f"inserted {local_rows} rows"
-                    )
-                
-                with thread_rows_lock:
-                    t_name = threading.current_thread().name
-                    thread_rows_counter[t_name] += local_rows
-                    thread_elapsed_counter[t_name] += elapsed
-                return local_rows
-            except Exception as e:
-                # Update progress counter even for failed entries
-                with entries_progress_lock:
-                    entries_processed += 1
-                # Log the failing coldkey/hotkey with stack trace for diagnostics
-                logging.exception(
-                    f"Error processing staking entry #{entry_idx}: coldkey={coldkey_ss58} – {e}"
-                )
-                return 0
+    except Exception as e:
+        logging.warning(f"Block {block_number}: {thread_name} error processing {task_id}: {e}")
+        update_progress('failed_hotkey_tasks', 1)
+        return None
+    finally:
+        # Always update completed count and release resources
+        update_progress('completed_hotkey_tasks', 1)
+        
+        # Decrement counters and release semaphore
+        with concurrent_lock:
+            concurrent_tasks -= 1
+        hotkey_query_semaphore.release()
 
-        # ---------------------- parallel processing -------------------------
-        processing_start = time.time()
+def extract_hotkeys_from_entry(entry):
+    """Extract and convert hotkeys from a staking entry."""
+    coldkey_raw = entry[0]
+    hotkeys_raw_list = entry[1]
+    coldkey_ss58 = to_ss58(coldkey_raw, 'coldkey')
+    
+    if not coldkey_ss58 or not hotkeys_raw_list:
+        return None, []
+    
+    if hasattr(hotkeys_raw_list, 'value'):
+        hotkeys_raw_list = hotkeys_raw_list.value
+    
+    # Extract all hotkeys for this coldkey
+    hotkeys = []
+    for hotkey_raw_container in hotkeys_raw_list:
+        hotkey_raw = hotkey_raw_container
+        if isinstance(hotkey_raw, (tuple, list)) and len(hotkey_raw) == 1 and isinstance(hotkey_raw[0], (tuple, list)):
+            hotkey_raw = hotkey_raw[0]
+        hotkey_ss58 = to_ss58(hotkey_raw, 'hotkey')
+        if hotkey_ss58:
+            hotkeys.append(hotkey_ss58)
+    
+    return coldkey_ss58, hotkeys
+
+def process_all_entries(staking_entries, netuids, pool, block_hash, block_number,
+                       block_timestamp, table_name):
+    """Process all staking entries with proper task distribution."""
+    processing_start = time.time()
+    rows_inserted = 0
+    rows_lock = threading.Lock()
+    
+    # Shared cache for hotkey metrics
+    hotkey_metrics_cache = {}
+    hotkey_metrics_lock = threading.Lock()
+    
+    total_entries = len(staking_entries)
+    
+    # Collect all tasks upfront
+    logging.info(f"Block {block_number}: collecting all stake processing tasks...")
+    
+    all_tasks = []
+    entry_task_counts = {}  # Track how many tasks each entry has
+    entries_to_complete = set()  # Entries that need completion tracking
+    
+    for idx, entry in enumerate(staking_entries):
+        coldkey_ss58, hotkeys = extract_hotkeys_from_entry(entry)
+        
+        if not coldkey_ss58 or not hotkeys:
+            # Don't mark as complete here - we'll do it after processing
+            continue
+        
+        task_count = 0
+        for hotkey_ss58 in hotkeys:
+            for netuid in netuids:
+                all_tasks.append((coldkey_ss58, hotkey_ss58, netuid, idx))
+                task_count += 1
+        
+        if task_count > 0:
+            entry_task_counts[idx] = task_count
+            entries_to_complete.add(idx)
+    
+    # Update actual task count and reset entries completed
+    actual_total_tasks = len(all_tasks)
+    update_progress('total_hotkey_tasks', actual_total_tasks, increment=False)
+    update_progress('completed_entries', 0, increment=False)  # Reset entries
+    update_progress('total_entries', len(entries_to_complete), increment=False)  # Only count valid entries
+    
+    logging.info(
+        f"Block {block_number}: processing {actual_total_tasks} tasks from "
+        f"{len(entry_task_counts)} entries using {HOTKEY_POOL_SIZE} workers"
+    )
+    
+    # Shuffle tasks to avoid all threads hitting same hotkey
+    import random
+    random.shuffle(all_tasks)
+    
+    # Track entry completions
+    entry_completed_tasks = defaultdict(int)
+    entry_completed_lock = threading.Lock()
+    entries_completed = set()
+    
+    # Process tasks in batches to avoid memory issues
+    batch_size = 10000
+    task_batches = [all_tasks[i:i + batch_size] for i in range(0, len(all_tasks), batch_size)]
+    
+    for batch_idx, batch in enumerate(task_batches):
+        logging.info(f"Block {block_number}: processing batch {batch_idx + 1}/{len(task_batches)} ({len(batch)} tasks)")
+        
+        with ThreadPoolExecutor(max_workers=HOTKEY_POOL_SIZE) as executor:
+            # Submit batch tasks
+            futures = []
+            for task in batch:
+                coldkey_ss58, hotkey_ss58, netuid, entry_idx = task
+                substrate_conn = pool.get()
+                
+                future = executor.submit(
+                    process_single_hotkey_subnet,
+                    coldkey_ss58, hotkey_ss58, netuid, substrate_conn,
+                    block_hash, block_number, block_timestamp,
+                    hotkey_metrics_cache, hotkey_metrics_lock
+                )
+                futures.append((future, substrate_conn, entry_idx))
+            
+            # Process results
+            for future, substrate_conn, entry_idx in futures:
+                try:
+                    result = future.result(timeout=60)
+                    if result:
+                        buffer_insert(table_name, result)
+                        with rows_lock:
+                            rows_inserted += 1
+                        update_progress('rows_inserted', 1)
+                    
+                    # Track entry completion
+                    with entry_completed_lock:
+                        entry_completed_tasks[entry_idx] += 1
+                        if (entry_idx not in entries_completed and 
+                            entry_idx in entry_task_counts and
+                            entry_completed_tasks[entry_idx] >= entry_task_counts[entry_idx]):
+                            entries_completed.add(entry_idx)
+                            update_progress('completed_entries', 1)
+                        
+                except Exception as e:
+                    logging.warning(f"Task processing error: {e}")
+                    update_progress('failed_hotkey_tasks', 1)
+                    
+                    # Still track completion for the entry
+                    with entry_completed_lock:
+                        entry_completed_tasks[entry_idx] += 1
+                        if (entry_idx not in entries_completed and 
+                            entry_idx in entry_task_counts and
+                            entry_completed_tasks[entry_idx] >= entry_task_counts[entry_idx]):
+                            entries_completed.add(entry_idx)
+                            update_progress('completed_entries', 1)
+                finally:
+                    pool.put(substrate_conn)
+    
+    processing_elapsed = time.time() - processing_start
+    return rows_inserted, processing_elapsed
+
+def log_final_stats(block_number, rows_inserted, processing_elapsed, block_elapsed):
+    """Log final statistics for the block processing."""
+    final_stats = get_progress_stats()
+    logging.info(
+        f"Block {block_number}: FINAL STATS - "
+        f"processed {final_stats['completed_entries']}/{final_stats['total_entries']} entries, "
+        f"completed {final_stats['completed_hotkey_tasks']}/{final_stats['total_hotkey_tasks']} hotkey tasks "
+        f"({final_stats['failed_hotkey_tasks']} failed) in {processing_elapsed:.2f}s, "
+        f"inserted {rows_inserted} rows. Total block time: {block_elapsed:.2f}s"
+    )
+
+def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_name):
+    """Main function to fetch all stakes at a specific block."""
+    block_start_time = time.time()
+    logging.info(f"Block {block_number}: starting stake snapshot")
+    
+    # Reset progress tracking
+    reset_progress_data(block_start_time)
+    
+    # Get connection pool and initial substrate connection
+    pool = get_pool(block_hash)
+    substrate = pool.get()
+    
+    try:
+        # Fetch active subnets
+        netuids = fetch_active_subnets(substrate, block_hash)
+        
+        # Get staking entries (from cache or fresh)
+        staking_entries = get_staking_entries(block_number, block_hash, substrate)
+        
+        if len(staking_entries) == 0:
+            raise ShovelProcessingError('No StakingHotkeys data returned')
+        
+        # Calculate and set total work metrics
+        total_hotkey_tasks, valid_entries = calculate_total_work(staking_entries, netuids)
+        
+        update_progress('total_entries', valid_entries, increment=False)
+        update_progress('total_hotkey_tasks', total_hotkey_tasks, increment=False)
         
         logging.info(
-            f"Block {block_number}: starting parallel processing of {total_entries} staking entries "
-            f"using {MAX_WORKERS} workers"
+            f"Block {block_number}: total work calculated - "
+            f"{valid_entries} valid entries (of {len(staking_entries)} total), "
+            f"~{total_hotkey_tasks} hotkey tasks"
         )
-
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_entry, idx, e) for idx, e in enumerate(staking_entries)]
-            for idx, fut in enumerate(futures):
-                rows_inserted += fut.result()
-                
-                # Log overall progress every 5000 completed futures
-                if (idx + 1) % 5000 == 0:
-                    progress_pct = ((idx + 1) / total_entries) * 100
-                    elapsed_so_far = time.time() - processing_start
-                    logging.info(
-                        f"Block {block_number}: completed {idx + 1}/{total_entries} entries "
-                        f"({progress_pct:.1f}%) in {elapsed_so_far:.1f}s, {rows_inserted} rows inserted so far"
-                    )
-
-        processing_elapsed = time.time() - processing_start
-        # Log per-thread contribution (rows inserted per worker)
-        for t_name, r_cnt in thread_rows_counter.items():
-            elapsed_t = thread_elapsed_counter.get(t_name, 0.0)
-            logging.info(
-                f"Block {block_number}: worker {t_name} inserted {r_cnt} rows in {elapsed_t:.2f}s"
+        
+        # Start progress monitor thread
+        stop_monitor = threading.Event()
+        monitor_thread = threading.Thread(
+            target=progress_monitor,
+            args=(block_number, stop_monitor),
+            daemon=True
+        )
+        monitor_thread.start()
+        
+        try:
+            # Process all entries
+            rows_inserted, processing_elapsed = process_all_entries(
+                staking_entries, netuids, pool, block_hash, 
+                block_number, block_timestamp, table_name
             )
-
-        block_elapsed = time.time() - block_start_time
-        logging.info(
-            f"Block {block_number}: processed {total_entries} staking entries in {processing_elapsed:.2f}s "
-            f"using {MAX_WORKERS} threads, inserted {rows_inserted} total rows"
-        )
+            
+            block_elapsed = time.time() - block_start_time
+            
+            # Log final statistics
+            log_final_stats(block_number, rows_inserted, processing_elapsed, block_elapsed)
+            
+        finally:
+            # Stop the monitor thread
+            stop_monitor.set()
+            monitor_thread.join(timeout=1)
+        
         return rows_inserted
-
+        
     except Exception as e:
         raise ShovelProcessingError(f'Error fetching stakes: {str(e)}')
-
-
-# ---------------------------------------------------------------------------
-# Parallel retrieval helper for the massive StakingHotkeys map
-# ---------------------------------------------------------------------------
-# def _fetch_staking_hotkeys_parallel(block_hash: str, block_number: int, page_size: int = PAGE_SIZE, fetch_workers: int = MAX_WORKERS):
-#     """Download the entire `SubtensorModule.StakingHotkeys` map using multiple
-#     `SubstrateInterface` connections in parallel.  Returns a list with the same
-#     shape as `substrate.query_map(...)` but typically several times faster on
-#     high-latency links."""
-
-#     task_queue: "Queue[str]" = Queue()
-#     collected_records = []
-#     collected_lock = threading.Lock()
-#     visited_start_keys = set()
-#     seen_keys = set()
-
-#     # Use a substrate client from the main thread only to derive the storage prefix.
-#     main_substrate = get_substrate_client()
-#     storage_key_prefix = main_substrate.create_storage_key(
-#         "SubtensorModule", "StakingHotkeys", []
-#     ).to_hex()
-
-#     # Seed the queue with 256 sub-prefixes (00-ff) so multiple workers start
-#     # immediately.  We'll deduplicate records as we collect them, so overlap
-#     # between buckets is no longer a correctness problem.
-
-#     for b in range(256):
-#         subprefix = storage_key_prefix + f"{b:02x}"
-#         task_queue.put(subprefix)
-#         visited_start_keys.add(subprefix)
-
-#     def worker():
-#         t_handshake_start = time.time()
-#         logging.info(
-#             f"Block {block_number}: {threading.current_thread().name} connecting to Substrate…"
-#         )
-#         local_substrate = get_substrate_client()
-#         logging.info(
-#             f"Block {block_number}: {threading.current_thread().name} connected ({time.time() - t_handshake_start:.2f}s handshake)"
-#         )
-#         started_at = time.time()
-#         pages_fetched = 0
-#         records_fetched = 0
-#         while True:
-#             start_key = task_queue.get()
-#             # A value of `None` is used as a sentinel to signal graceful shutdown.
-#             if start_key is None:
-#                 task_queue.task_done()
-#                 break
-
-#             try:
-#                 page_t0 = time.time()
-#                 qmr = _retry_on_disconnect(
-#                     local_substrate.query_map,
-#                     module="SubtensorModule",
-#                     storage_function="StakingHotkeys",
-#                     block_hash=block_hash,
-#                     page_size=page_size,
-#                     start_key=start_key,
-#                 )
-#                 page_elapsed = time.time() - page_t0
-#                 logging.info(
-#                     f"Block {block_number}: {threading.current_thread().name} fetched page with {len(qmr.records)} records in {page_elapsed:.2f}s"
-#                 )
-
-#                 page_records = qmr.records  # Only the first page! Avoid implicit pagination.
-
-#                 # Deduplicate by coldkey storage key (the first element of each
-#                 # record tuple).  This avoids the massive double-count we saw
-#                 # when multiple bucket scans return overlapping keys.
-#                 with collected_lock:
-#                     for rec in page_records:
-#                         key = rec[0]
-#                         if key not in seen_keys:
-#                             seen_keys.add(key)
-#                             collected_records.append(rec)
-
-#                 # ---- progress bookkeeping ------------------------------------
-#                 with progress_lock:
-#                     global pages_done
-#                     if len(page_records) > 0:
-#                         pages_done += 1
-#                     if pages_done % 5 == 0:
-#                         logging.info(
-#                             f"Block {block_number}: {pages_done} pages fetched (≈{len(seen_keys)} unique records)"
-#                         )
-#                 # --------------------------------------------------------------
-
-#                 # If the page is full, schedule the next page.
-#                 if len(page_records) == page_size and qmr.last_key and qmr.last_key not in visited_start_keys:
-#                     visited_start_keys.add(qmr.last_key)
-#                     task_queue.put(qmr.last_key)
-
-#                 pages_fetched += 1
-#                 records_fetched += len(page_records)
-
-#             finally:
-#                 task_queue.task_done()
-
-#         elapsed = time.time() - started_at
-#         logging.info(
-#             f"Block {block_number}: worker {threading.current_thread().name} fetched {records_fetched} records ({pages_fetched} pages) in {elapsed:.2f}s"
-#         )
-
-#     overall_start = time.time()
-#     logging.info(
-#         f"Block {block_number}: starting parallel StakingHotkeys fetch with {fetch_workers} workers"
-#     )
-#     threads = [threading.Thread(target=worker, daemon=True) for _ in range(fetch_workers)]
-#     for t in threads:
-#         t.start()
-
-#     task_queue.join()
-#     # Send one sentinel per worker to signal that no more tasks will arrive.
-#     for _ in threads:
-#         task_queue.put(None)
-
-#     # Wait for all worker threads to terminate cleanly before returning.
-#     for t in threads:
-#         t.join()
-
-#     overall_elapsed = time.time() - overall_start
-#     logging.info(
-#         f"Block {block_number}: parallel StakingHotkeys fetch finished, {len(seen_keys)} unique records in {overall_elapsed:.2f}s using {fetch_workers} workers"
-#     )
-#     return collected_records
-
+    finally:
+        pool.put(substrate)
 
 def main():
     StakeDailyMapShovel(name="stake_daily_map").start()
