@@ -18,7 +18,7 @@ from hotkeys import _fetch_staking_hotkeys_parallel_pooled
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s- %(message)s")
 
 # Mute very verbose third-party libraries; keep our DEBUG statements visible.
@@ -33,6 +33,30 @@ for noisy in (
     "urllib3",
 ):
     logging.getLogger(noisy).setLevel(logging.WARNING)
+
+parallel_logger = logging.getLogger('parallel_debug')
+parallel_logger.setLevel(logging.INFO)
+
+# Add these new global variables
+active_workers = {}
+active_workers_lock = threading.Lock()
+
+# Add this new helper function
+def log_worker_activity(worker_id, status, details=""):
+    """Log worker activity with timestamps."""
+    with active_workers_lock:
+        if status == "start":
+            active_workers[worker_id] = time.time()
+        elif status == "end" and worker_id in active_workers:
+            duration = time.time() - active_workers[worker_id]
+            del active_workers[worker_id]
+            details += f" (duration: {duration:.2f}s)"
+        
+        active_count = len(active_workers)
+    
+    parallel_logger.info(
+        f"[WORKER {status.upper()}] {worker_id} | Active workers: {active_count}/{HOTKEY_POOL_SIZE} | {details}"
+    )
 
 # ---------------------------------------------------------------------------
 # Filter out DEBUG logs emitted by third-party libraries that use the root
@@ -88,6 +112,300 @@ progress_lock   = threading.Lock()
 pages_done = 0
 LOG_EVERY_PAGES = 10          # adjust as you like
 # ----------------------------------------------------------------------
+def process_all_entries_debug(staking_entries, netuids, pool, block_hash, block_number,
+                             block_timestamp, table_name):
+    """Enhanced version with detailed parallel execution logging."""
+    processing_start = time.time()
+    rows_inserted = 0
+    rows_lock = threading.Lock()
+    
+    # Shared cache for hotkey metrics
+    hotkey_metrics_cache = {}
+    hotkey_metrics_lock = threading.Lock()
+    
+    # Track batch processing times
+    batch_times = []
+    batch_times_lock = threading.Lock()
+    
+    logging.info(f"Block {block_number}: Starting parallel processing with {HOTKEY_POOL_SIZE} workers")
+    
+    # Collect all tasks
+    logging.info(f"Block {block_number}: Collecting tasks...")
+    
+    tasks_by_entry = defaultdict(list)
+    all_tasks = []
+    valid_entries = 0
+    
+    for idx, entry in enumerate(staking_entries):
+        if idx % 5000 == 0:
+            logging.info(f"Collecting tasks: {idx}/{len(staking_entries)} entries")
+        
+        coldkey_ss58, hotkeys = extract_hotkeys_from_entry(entry)
+        if not coldkey_ss58 or not hotkeys:
+            continue
+        
+        valid_entries += 1
+        
+        for hotkey_ss58 in hotkeys:
+            for netuid in netuids:
+                task = (coldkey_ss58, hotkey_ss58, netuid, idx)
+                tasks_by_entry[idx].append(task)
+                all_tasks.append(task)
+    
+    total_tasks = len(all_tasks)
+    update_progress('total_hotkey_tasks', total_tasks, increment=False)
+    update_progress('total_entries', valid_entries, increment=False)
+    
+    # Create smaller batches for better parallelization
+    batch_size = max(50, total_tasks // (HOTKEY_POOL_SIZE * 20))  # Smaller batches
+    task_batches = [all_tasks[i:i + batch_size] for i in range(0, len(all_tasks), batch_size)]
+    
+    logging.info(
+        f"Block {block_number}: Created {len(task_batches)} batches of ~{batch_size} tasks each. "
+        f"Total tasks: {total_tasks} from {valid_entries} entries"
+    )
+    
+    # Shuffle batches for better distribution
+    random.shuffle(task_batches)
+    
+    # Track batch assignment
+    batch_assignment = {}
+    completed_batches = set()
+    failed_batches = set()
+    
+    def process_batch_with_logging(batch_idx, batch):
+        """Process a batch with detailed logging."""
+        worker_name = threading.current_thread().name
+        worker_id = f"{worker_name}-B{batch_idx}"
+        
+        # Log worker start
+        log_worker_activity(worker_id, "start", f"Processing batch {batch_idx} ({len(batch)} tasks)")
+        
+        batch_start = time.time()
+        batch_rows = 0
+        batch_completed = 0
+        batch_failed = 0
+        
+        # Track batch assignment
+        batch_assignment[batch_idx] = worker_name
+        
+        # Get connection from pool
+        conn_start = time.time()
+        substrate_conn = pool.get()
+        conn_time = time.time() - conn_start
+        
+        if conn_time > 1.0:
+            logging.warning(f"{worker_name}: Slow connection acquisition: {conn_time:.2f}s")
+        
+        try:
+            # Initialize connection if needed
+            init_start = time.time()
+            if hasattr(substrate_conn, '_ensure_initialized'):
+                substrate_conn._ensure_initialized()
+            elif not hasattr(substrate_conn, 'metadata') or substrate_conn.metadata is None:
+                substrate_conn.init_runtime(block_hash=block_hash)
+            init_time = time.time() - init_start
+            
+            if init_time > 1.0:
+                logging.warning(f"{worker_name}: Slow connection init: {init_time:.2f}s")
+            
+            # Log batch processing start
+            parallel_logger.info(
+                f"[BATCH START] {worker_name} processing batch {batch_idx}/{len(task_batches)} "
+                f"({len(batch)} tasks)"
+            )
+            
+            # Process tasks
+            task_times = []
+            for task_idx, (coldkey_ss58, hotkey_ss58, netuid, entry_idx) in enumerate(batch):
+                task_start = time.time()
+                
+                try:
+                    result = process_single_hotkey_subnet_with_timing(
+                        coldkey_ss58, hotkey_ss58, netuid, substrate_conn,
+                        block_hash, block_number, block_timestamp,
+                        hotkey_metrics_cache, hotkey_metrics_lock
+                    )
+                    
+                    if result:
+                        buffer_insert(table_name, result)
+                        batch_rows += 1
+                        with rows_lock:
+                            nonlocal rows_inserted
+                            rows_inserted += 1
+                        update_progress('rows_inserted', 1)
+                    
+                    batch_completed += 1
+                    task_time = time.time() - task_start
+                    task_times.append(task_time)
+                    
+                    # Log slow tasks
+                    if task_time > 1.0:
+                        logging.warning(
+                            f"{worker_name}: Slow task {hotkey_ss58[:8]}/{netuid} took {task_time:.2f}s"
+                        )
+                    
+                    # Periodic progress within batch
+                    if task_idx > 0 and task_idx % 100 == 0:
+                        avg_task_time = sum(task_times[-100:]) / len(task_times[-100:])
+                        parallel_logger.info(
+                            f"[BATCH PROGRESS] {worker_name} B{batch_idx}: {task_idx}/{len(batch)} "
+                            f"({task_idx/len(batch)*100:.1f}%), avg task time: {avg_task_time:.3f}s"
+                        )
+                    
+                except Exception as e:
+                    logging.error(f"{worker_name}: Task failed: {e}")
+                    batch_failed += 1
+                    update_progress('failed_hotkey_tasks', 1)
+                
+                update_progress('completed_hotkey_tasks', 1)
+            
+            # Calculate batch statistics
+            batch_elapsed = time.time() - batch_start
+            avg_task_time = sum(task_times) / len(task_times) if task_times else 0
+            tasks_per_second = batch_completed / batch_elapsed if batch_elapsed > 0 else 0
+            
+            # Log batch completion
+            parallel_logger.info(
+                f"[BATCH COMPLETE] {worker_name} B{batch_idx}: "
+                f"{batch_completed} tasks in {batch_elapsed:.1f}s "
+                f"({tasks_per_second:.1f} tasks/s), "
+                f"avg task: {avg_task_time:.3f}s, "
+                f"{batch_rows} rows, {batch_failed} failed"
+            )
+            
+            # Track batch time
+            with batch_times_lock:
+                batch_times.append((batch_idx, batch_elapsed, tasks_per_second))
+            
+            completed_batches.add(batch_idx)
+            
+            return batch_completed, batch_failed, batch_rows, batch_elapsed
+            
+        except Exception as e:
+            logging.error(f"{worker_name}: Batch {batch_idx} failed: {e}")
+            failed_batches.add(batch_idx)
+            remaining = len(batch) - batch_completed
+            update_progress('failed_hotkey_tasks', remaining)
+            update_progress('completed_hotkey_tasks', remaining)
+            return batch_completed, batch_failed + remaining, batch_rows, time.time() - batch_start
+            
+        finally:
+            # Return connection
+            pool.put(substrate_conn)
+            
+            # Log worker end
+            log_worker_activity(worker_id, "end", f"Batch {batch_idx} done")
+    
+    # Monitor thread to log parallel execution status
+    def monitor_parallel_execution(stop_event):
+        """Monitor and log parallel execution status."""
+        while not stop_event.is_set():
+            with active_workers_lock:
+                active = list(active_workers.keys())
+            
+            if active:
+                parallel_logger.info(
+                    f"[PARALLEL STATUS] Active workers: {len(active)}/{HOTKEY_POOL_SIZE} | "
+                    f"Workers: {', '.join(active[:10])}{'...' if len(active) > 10 else ''} | "
+                    f"Completed batches: {len(completed_batches)}/{len(task_batches)}"
+                )
+            
+            time.sleep(3)
+    
+    # Start monitor
+    stop_monitor = threading.Event()
+    monitor_thread = threading.Thread(
+        target=monitor_parallel_execution,
+        args=(stop_monitor,),
+        daemon=True
+    )
+    monitor_thread.start()
+    
+    # Process batches in parallel
+    logging.info(f"Block {block_number}: Starting ThreadPoolExecutor with {HOTKEY_POOL_SIZE} workers")
+    
+    completed_tasks = 0
+    failed_tasks = 0
+    
+    with ThreadPoolExecutor(max_workers=HOTKEY_POOL_SIZE, thread_name_prefix='Worker') as executor:
+        # Submit all batches
+        future_to_batch = {
+            executor.submit(process_batch_with_logging, idx, batch): (idx, batch)
+            for idx, batch in enumerate(task_batches)
+        }
+        
+        logging.info(f"Block {block_number}: Submitted {len(future_to_batch)} batches to executor")
+        
+        # Track completion
+        for i, future in enumerate(as_completed(future_to_batch)):
+            batch_idx, batch = future_to_batch[future]
+            
+            try:
+                batch_completed, batch_failed, batch_rows, batch_time = future.result()
+                completed_tasks += batch_completed
+                failed_tasks += batch_failed
+                
+                # Log overall progress
+                progress_pct = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+                elapsed = time.time() - processing_start
+                overall_rate = completed_tasks / elapsed if elapsed > 0 else 0
+                
+                # Calculate parallel efficiency
+                with batch_times_lock:
+                    if batch_times:
+                        recent_times = batch_times[-10:]
+                        avg_batch_time = sum(t[1] for t in recent_times) / len(recent_times)
+                        avg_batch_rate = sum(t[2] for t in recent_times) / len(recent_times)
+                        parallel_efficiency = (avg_batch_rate * HOTKEY_POOL_SIZE) / overall_rate if overall_rate > 0 else 0
+                    else:
+                        avg_batch_time = 0
+                        parallel_efficiency = 0
+                
+                logging.info(
+                    f"Block {block_number}: Batch {batch_idx} done ({i+1}/{len(task_batches)}). "
+                    f"Progress: {completed_tasks}/{total_tasks} ({progress_pct:.1f}%), "
+                    f"Rate: {overall_rate:.1f} tasks/s, "
+                    f"Avg batch time: {avg_batch_time:.1f}s, "
+                    f"Parallel efficiency: {parallel_efficiency:.1f}x, "
+                    f"Rows: {rows_inserted}"
+                )
+                
+            except Exception as e:
+                logging.error(f"Batch {batch_idx} failed: {e}")
+    
+    # Stop monitor
+    stop_monitor.set()
+    monitor_thread.join(timeout=1)
+    
+    processing_elapsed = time.time() - processing_start
+    
+    # Log final statistics with parallel efficiency analysis
+    with batch_times_lock:
+        if batch_times:
+            total_batch_time = sum(t[1] for t in batch_times)
+            avg_batch_time = total_batch_time / len(batch_times)
+            theoretical_serial_time = total_batch_time
+            actual_parallel_time = processing_elapsed
+            speedup = theoretical_serial_time / actual_parallel_time if actual_parallel_time > 0 else 0
+            
+            logging.info(
+                f"Block {block_number}: PARALLEL ANALYSIS - "
+                f"Serial time (sum of batches): {theoretical_serial_time/60:.1f}m, "
+                f"Parallel time: {actual_parallel_time/60:.1f}m, "
+                f"Speedup: {speedup:.1f}x, "
+                f"Efficiency: {speedup/HOTKEY_POOL_SIZE*100:.1f}%"
+            )
+    
+    logging.info(
+        f"Block {block_number}: COMPLETED - "
+        f"Processed {completed_tasks} tasks ({failed_tasks} failed) in {processing_elapsed/60:.1f}m "
+        f"({completed_tasks/processing_elapsed:.1f} tasks/s), "
+        f"inserted {rows_inserted} rows"
+    )
+    
+    return rows_inserted, processing_elapsed
+
 
 def _retry_on_disconnect(func, *args, **kwargs):
     """Call substrate function with automatic reconnect on Broken pipe / connection reset."""
@@ -603,7 +921,12 @@ def process_all_entries(staking_entries, netuids, pool: SubstrateConnectionPool,
                     logging.error(f"{worker_name}: Failed to initialize connection: {e}")
                     raise
             
-            logging.info(f"{worker_name}: Starting batch {batch_idx} with {len(batch)} tasks")
+            logging.info(
+                f"{worker_name}: Starting batch {batch_idx} with {len(batch)} tasks",
+                stacklevel=2,
+            ) if False else logging.debug(
+                f"{worker_name}: Starting batch {batch_idx} with {len(batch)} tasks"
+            )
             
             for task_idx, (coldkey_ss58, hotkey_ss58, netuid, entry_idx) in enumerate(batch):
                 try:
@@ -633,7 +956,7 @@ def process_all_entries(staking_entries, netuids, pool: SubstrateConnectionPool,
                             entries_completed.add(entry_idx)
                             update_progress('completed_entries', 1)
                     
-                    # Log progress periodically
+                    # Suppress per-batch detailed progress logs; keep overall monitor
                     if task_idx > 0 and task_idx % 50 == 0:
                         elapsed = time.time() - batch_start
                         rate = batch_completed / elapsed
@@ -643,7 +966,7 @@ def process_all_entries(staking_entries, netuids, pool: SubstrateConnectionPool,
                         )
                     
                 except Exception as e:
-                    logging.error(f"{worker_name}: Task failed: {e}")
+                    logging.debug(f"{worker_name}: Task failed: {e}")
                     batch_failed += 1
                     update_progress('failed_hotkey_tasks', 1)
                     
@@ -659,7 +982,7 @@ def process_all_entries(staking_entries, netuids, pool: SubstrateConnectionPool,
                 update_progress('completed_hotkey_tasks', 1)
             
             batch_elapsed = time.time() - batch_start
-            logging.info(
+            logging.debug(
                 f"{worker_name}: Completed batch {batch_idx} - "
                 f"{batch_completed} tasks in {batch_elapsed:.1f}s "
                 f"({batch_completed/batch_elapsed:.1f} tasks/s), "
@@ -669,7 +992,7 @@ def process_all_entries(staking_entries, netuids, pool: SubstrateConnectionPool,
             return batch_completed, batch_failed, batch_rows
             
         except Exception as e:
-            logging.error(f"{worker_name}: Batch {batch_idx} failed: {e}")
+            logging.debug(f"{worker_name}: Batch {batch_idx} failed: {e}")
             # Mark all remaining tasks as failed
             remaining = len(batch) - batch_completed
             update_progress('failed_hotkey_tasks', remaining)
@@ -750,7 +1073,7 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
             args=(block_number, stop_monitor, 5.0),  # Log every 5 seconds
             daemon=True
         )
-        # monitor_thread.start()
+        monitor_thread.start()
         
         try:
             # Fetch active subnets
@@ -776,7 +1099,7 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
             )
             
             # Process with fixed function
-            rows_inserted, processing_elapsed = process_all_entries(
+            rows_inserted, processing_elapsed = process_all_entries_debug(
                 staking_entries, netuids, pool, block_hash,
                 block_number, block_timestamp, table_name
             )
@@ -801,68 +1124,114 @@ def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_n
         if substrate:
             pool.put(substrate)
 
-def process_single_hotkey_subnet(coldkey_ss58, hotkey_ss58, netuid, substrate_conn, 
+def process_single_hotkey_subnet_with_timing(coldkey_ss58, hotkey_ss58, netuid, substrate_conn, 
                                block_hash, block_number, block_timestamp,
                                hotkey_metrics_cache, hotkey_metrics_lock):
-    """Process a single hotkey-subnet combination with detailed concurrency logging."""
+    """Process a single hotkey-subnet combination with detailed timing logs."""
     global concurrent_tasks
     
-    # Acquire semaphore to enforce a hard upper-bound on concurrent RPCs
+    task_id = f"{hotkey_ss58[:8]}/{netuid}"
+    thread_name = threading.current_thread().name
+    task_start = time.time()
+    
+    # Dictionary to track timing of each operation
+    timings = {
+        'semaphore_acquire': 0,
+        'alpha_query': 0,
+        'metrics_cache_check': 0,
+        'total_hotkey_alpha_query': 0,
+        'total_hotkey_shares_query': 0,
+        'calculations': 0,
+        'total': 0
+    }
+    
+    # Acquire semaphore with timing
+    sem_start = time.time()
     hotkey_query_semaphore.acquire()
+    timings['semaphore_acquire'] = time.time() - sem_start
     
     with concurrent_lock:
         concurrent_tasks += 1
         current_concurrent = concurrent_tasks
-    
-    thread_name = threading.current_thread().name
-    task_id = f"{hotkey_ss58[:8]}/{netuid}"
-    
-    # Log when we start to show concurrency
-    start_time = time.time()
-    logging.info(
-        f"[CONCURRENT START] Block {block_number}: {thread_name} starting {task_id} "
-        f"| Active: {current_concurrent}/{HOTKEY_POOL_SIZE} threads"
-    )
     
     try:
         # Handle metadata errors with retry
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                # Log each RPC call
-                t1 = time.time()
+                # Query Alpha with detailed timing
+                alpha_start = time.time()
                 alpha_share_float = _query_fixed_float(
                     substrate_conn,
                     'Alpha',
                     [hotkey_ss58, coldkey_ss58, netuid],
                     block_hash,
                 )
-                alpha_time = time.time() - t1
+                timings['alpha_query'] = time.time() - alpha_start
                 
                 if alpha_share_float == 0:
-                    logging.debug(f"[ZERO ALPHA] {task_id} has no stake (query took {alpha_time:.2f}s)")
                     return None
                 
-                # Log second RPC
-                t2 = time.time()
-                hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics_cached(
-                    netuid, hotkey_ss58, substrate_conn, block_hash,
-                    hotkey_metrics_cache, hotkey_metrics_lock
-                )
-                metrics_time = time.time() - t2
+                # Get hotkey metrics with timing breakdown
+                metrics_start = time.time()
+                
+                # Check cache first
+                cache_check_start = time.time()
+                key_local = (netuid, hotkey_ss58)
+                with hotkey_metrics_lock:
+                    cached = key_local in hotkey_metrics_cache
+                    if cached:
+                        hotkey_alpha_int, total_hotkey_shares_float = hotkey_metrics_cache[key_local]
+                timings['metrics_cache_check'] = time.time() - cache_check_start
+                
+                if not cached:
+                    # Query TotalHotkeyAlpha
+                    alpha_query_start = time.time()
+                    hotkey_alpha_int = _query_int(
+                        substrate_conn,
+                        'TotalHotkeyAlpha',
+                        [hotkey_ss58, netuid],
+                        block_hash,
+                    )
+                    timings['total_hotkey_alpha_query'] = time.time() - alpha_query_start
+                    
+                    # Query TotalHotkeyShares
+                    shares_query_start = time.time()
+                    total_hotkey_shares_float = _query_fixed_float(
+                        substrate_conn,
+                        'TotalHotkeyShares',
+                        [hotkey_ss58, netuid],
+                        block_hash,
+                    )
+                    timings['total_hotkey_shares_query'] = time.time() - shares_query_start
+                    
+                    # Cache the results
+                    with hotkey_metrics_lock:
+                        hotkey_metrics_cache[key_local] = (hotkey_alpha_int, total_hotkey_shares_float)
                 
                 if total_hotkey_shares_float == 0:
                     return None
                 
+                # Calculations
+                calc_start = time.time()
                 stake_tao = int(alpha_share_float * hotkey_alpha_int / total_hotkey_shares_float)
                 alpha_int = int(alpha_share_float)
+                timings['calculations'] = time.time() - calc_start
                 
-                total_time = time.time() - start_time
-                logging.info(
-                    f"[CONCURRENT COMPLETE] {thread_name} finished {task_id} in {total_time:.2f}s "
-                    f"(alpha: {alpha_time:.2f}s, metrics: {metrics_time:.2f}s) | "
-                    f"Active: {current_concurrent}/{HOTKEY_POOL_SIZE}"
-                )
+                # Total time
+                timings['total'] = time.time() - task_start
+                
+                # Log detailed timing if task was slow
+                if timings['total'] > 1.0:
+                    logging.warning(
+                        f"{thread_name}: SLOW TASK {task_id} took {timings['total']:.2f}s | "
+                        f"Breakdown: semaphore={timings['semaphore_acquire']:.3f}s, "
+                        f"alpha_query={timings['alpha_query']:.3f}s, "
+                        f"cache_check={timings['metrics_cache_check']:.3f}s, "
+                        f"hotkey_alpha_query={timings['total_hotkey_alpha_query']:.3f}s, "
+                        f"hotkey_shares_query={timings['total_hotkey_shares_query']:.3f}s, "
+                        f"calc={timings['calculations']:.3f}s"
+                    )
                 
                 return [
                     block_number,
@@ -898,9 +1267,40 @@ def process_single_hotkey_subnet(coldkey_ss58, hotkey_ss58, netuid, substrate_co
             concurrent_tasks -= 1
             remaining = concurrent_tasks
         hotkey_query_semaphore.release()
-        
-        logging.debug(f"[CONCURRENT END] {thread_name} released resources | Active: {remaining}/{HOTKEY_POOL_SIZE}")
 
+# Also enhance the _query_int and _query_fixed_float functions with timing
+def _query_int_with_timing(substrate, func, params, block_hash):
+    """Query with timing breakdown."""
+    query_start = time.time()
+    res = substrate.query(
+        'SubtensorModule',
+        func,
+        params,
+        block_hash=block_hash
+    )
+    query_time = time.time() - query_start
+    
+    # Log slow queries
+    if query_time > 0.5:
+        logging.warning(
+            f"SLOW RPC: {func} took {query_time:.3f}s for params {params[0][:8] if params else 'none'}"
+        )
+    
+    return _extract_int(res.value if hasattr(res, 'value') else res)
+
+def _query_fixed_float_with_timing(substrate, func, params, block_hash):
+    """Query with timing breakdown."""
+    query_start = time.time()
+    bits = _query_int(substrate, func, params, block_hash)
+    query_time = time.time() - query_start
+    
+    # Log slow queries
+    if query_time > 0.5:
+        logging.warning(
+            f"SLOW RPC: {func} took {query_time:.3f}s for params {params[0][:8] if params else 'none'}"
+        )
+    
+    return _fixed128_to_float(bits)
 def extract_hotkeys_from_entry(entry):
     """Extract and convert hotkeys from a staking entry."""
     coldkey_raw = entry[0]
