@@ -134,7 +134,7 @@ class SubstrateConnectionPool:
                 logging.error(f"Failed to create additional connection: {e}")
                 break
     
-    def get(self):
+    def get(self)->LazySubstrateConnection:
         """Get a connection from the pool."""
         return self.connections.get()
     
