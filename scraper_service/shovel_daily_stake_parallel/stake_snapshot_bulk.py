@@ -35,7 +35,7 @@ WS_URL = os.getenv("SUBTENSOR_WS", "wss://private.chain.opentensor.ai:443")
 # smaller of env-override and 1000 to avoid "count exceeds maximum value" errors.
 PAGE_SZ = min(int(os.getenv("PAGE_SZ", "1000")), 1000)
 # batch size for query_multi
-BATCH_SZ = int(os.getenv("BATCH_SZ", "500"))
+BATCH_SZ = int(os.getenv("BATCH_SZ", "20000"))
 # ----------------------------------------------------------------------
 
 U64F64_FACTOR = 1 << 64  # 2^64 (used to convert fixed-point numbers)
@@ -154,6 +154,9 @@ class ChainReader:
             return results
 
         total_chunks = math.ceil(total / BATCH_SZ)
+        # Track timing over groups of 50 chunks instead of each individual RPC call.
+        group_start = time.time()
+        chunks_in_group = 0  # how many chunks have been processed in current timing group
 
         for i in range(0, total, BATCH_SZ):
             chunk = calls[i : i + BATCH_SZ]
@@ -169,10 +172,7 @@ class ChainReader:
                     raise ValueError("batch_query only supports Alpha calls of form (hot, cold, netuid)")
 
                 hot, cold, netuid = params
-                time_before = time.time()
                 hex_keys.append(self._alpha_key(hot, cold, int(netuid)))
-                time_after = time.time()
-                print(f"time taken to create storage key: {time_after - time_before} seconds")
 
             if label:
                 logging.info(f"[{label}] chunk {chunk_num}/{total_chunks} – querying {len(hex_keys)} keys")
@@ -184,6 +184,18 @@ class ChainReader:
             except Exception as e:
                 logging.error(f"state_queryStorageAt failed: {e}")
                 val_map = {}
+
+            # Accumulate chunk count and, once we hit 50 chunks, log the elapsed time.
+            chunks_in_group += 1
+            if chunks_in_group == 50:
+                elapsed = time.time() - group_start
+                if label:
+                    logging.info(f"[{label}] 50 chunks completed in {elapsed:.2f}s ({50 / elapsed:.1f} chunks/s)")
+                else:
+                    logging.info(f"50 chunks completed in {elapsed:.2f}s ({50 / elapsed:.1f} chunks/s)")
+                # reset counters for next group
+                group_start = time.time()
+                chunks_in_group = 0
 
             for key_hex in hex_keys:
                 v_hex = val_map.get(key_hex)
@@ -208,15 +220,19 @@ def main():
     chain = ChainReader(WS_URL)
 
     logging.info("Fetching active subnets …")
+    time_before = time.time()
     netuids = chain.active_subnets()
-    logging.info(f"Active subnets: {netuids}")
+    time_after = time.time()
+    logging.info(f"Active subnets: {netuids} in {time_after - time_before} seconds")
 
     # -------------------------------------------------
     # Enumerate cold→hot key relations once.
     # -------------------------------------------------
     logging.info("Enumerating StakingHotkeys …")
+    time_before = time.time()
     staking_entries = chain.staking_hotkeys()  # List[(cold_ss58, [hot_ss58,…])]
-    logging.info(f"Total cold-keys: {len(staking_entries):,}")
+    time_after = time.time()
+    logging.info(f"Total cold-keys: {len(staking_entries):,} in {time_after - time_before} seconds")
 
     # -------------------------------------------------
     # Pre-load TotalHotkeyAlpha & Shares for all (hot, net) pairs.
@@ -225,15 +241,22 @@ def main():
     hot_alpha: Dict[Tuple[str, int], int] = {}
     t0 = time.time()
     entries = chain.substrate.query_map("SubtensorModule", "TotalHotkeyAlpha", page_size=PAGE_SZ)
+    time_after = time.time()
+    logging.info(f"TotalHotkeyAlpha: {len(list(entries)):,} in {time_after - time_before} seconds")
+    time_before = time.time()
     for (hot, netuid_raw), alpha_val in entries:
         netuid = int(extract_value(netuid_raw))
         hot_alpha[(str(extract_value(hot)), netuid)] = to_int(extract_value(alpha_val))
-    logging.info(f"Loaded {len(hot_alpha):,} TotalHotkeyAlpha entries in {time.time() - t0:.1f}s")
+    time_after = time.time()
+    logging.info(f"Loaded {len(hot_alpha):,} TotalHotkeyAlpha entries in {time_after - time_before:.1f}s")
 
     logging.info("Pre-loading TotalHotkeyShares …")
     hot_shares: Dict[Tuple[str, int], float] = {}
     t0 = time.time()
     entries = chain.substrate.query_map("SubtensorModule", "TotalHotkeyShares", page_size=PAGE_SZ)
+    time_after = time.time()
+    logging.info(f"TotalHotkeyShares: {len(list(entries))}:, in {time_after - time_before} seconds")
+    time_before = time.time()
     for (hot, netuid_raw), shares_val in entries:
         netuid = int(extract_value(netuid_raw))
         try:
@@ -242,7 +265,8 @@ def main():
             continue  # skip malformed entry
         shares_float = u64f64_to_float(shares_int)
         hot_shares[(str(extract_value(hot)), netuid)] = shares_float
-    logging.info(f"Loaded {len(hot_shares):,} TotalHotkeyShares entries in {time.time() - t0:.1f}s")
+    time_after = time.time()
+    logging.info(f"Loaded {len(hot_shares):,} TotalHotkeyShares entries in {time_after - time_before:.1f}s")
 
     # -------------------------------------------------
     # Stream Alpha map and accumulate stake per cold-key
@@ -258,6 +282,7 @@ def main():
     # 1. Build all Alpha keys we still need
     calls = []
     key_info = []          # keep (hot, cold, netuid) alongside its StorageKey
+    print(f"building calls.... with {len(staking_entries)} cold keys")
     for cold, hotkeys in staking_entries:        # from chain.staking_hotkeys()
         for hot in hotkeys:
             for netuid in netuids:
