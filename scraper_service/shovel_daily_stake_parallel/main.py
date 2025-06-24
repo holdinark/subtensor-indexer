@@ -102,7 +102,7 @@ _staking_hotkeys_cache = {
 CACHE_REFRESH_INTERVAL = BLOCKS_PER_DAY
 
 # Thread-pool size for parallel hotkey processing
-MAX_WORKERS = 12   # at most 32 threads
+MAX_WORKERS = 4   # at most 32 threads
 
 # Page size for each paged RPC call
 PAGE_SIZE = 1000
