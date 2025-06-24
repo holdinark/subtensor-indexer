@@ -36,22 +36,19 @@ class ShovelBaseClass:
                 print("Initialising Substrate client")
                 substrate = get_substrate_client()
 
-                print("Fetching the finalized block 2")
+                print("Fetching the finalized block")
                 finalized_block_hash = substrate.get_chain_finalised_head()
                 finalized_block_number = substrate.get_block_number(finalized_block_hash)
 
                 # Start the clickhouse buffer
-                print("Starting Clickhouse buffer2")
-                try:
-                    executor = ThreadPoolExecutor(max_workers=1)
-                    buffer_thread = threading.Thread(
-                        target=flush_buffer,
-                        args=(executor, self._buffer_flush_started, self._buffer_flush_done),
-                        daemon=True
-                    )
-                    buffer_thread.start()
-                except Exception as e:
-                    logging.error(f"Failed to start buffer thread: {str(e)}")
+                print("Starting Clickhouse buffer")
+                executor = ThreadPoolExecutor(max_workers=1)
+                buffer_thread = threading.Thread(
+                    target=flush_buffer,
+                    args=(executor, self._buffer_flush_started, self._buffer_flush_done),
+                    daemon=True  # Make it a daemon thread so it exits with the main thread
+                )
+                buffer_thread.start()
 
                 last_scraped_block_number = self.get_checkpoint()
                 logging.info(f"Last scraped block is {last_scraped_block_number}")

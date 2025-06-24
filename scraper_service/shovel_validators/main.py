@@ -199,7 +199,6 @@ def fetch_validator_stats(substrate, address: str, block_hash: str, delegate_inf
 def fetch_validator_stats_for_child(substrate, child_address: str, parent_address: str, block_hash: str, delegate_info) -> Dict[str, Any]:
     """Fetch stats for a child key validator."""
     try:
-        # Get parent's info
         parent_info = next((d for d in delegate_info if decode_account_id(d['delegate_ss58']) == parent_address), None)
 
         if not parent_info:
@@ -216,9 +215,7 @@ def fetch_validator_stats_for_child(substrate, child_address: str, parent_addres
         registrations = []
 
         for net_uid in subnet_uids:
-            # First check if parent is registered in this subnet
             if is_registered_in_subnet(substrate, net_uid, parent_address, block_hash):
-                # Then check if child is a child key of this parent in this subnet
                 child_keys = get_child_keys_for_validator(substrate, parent_address, net_uid, block_hash)
                 if any(child_hotkey == child_address for child_hotkey, _ in child_keys):
                     registrations.append(net_uid)
@@ -230,8 +227,8 @@ def fetch_validator_stats_for_child(substrate, child_address: str, parent_addres
                     logging.info(f"Child key {child_address} registered through parent {parent_address} in subnet {net_uid}")
 
         return {
-            "nominators": 0,  # Child keys don't have direct nominators
-            "daily_return": 0.0,  # Child keys don't have direct returns
+            "nominators": 0,
+            "daily_return": 0.0,
             "registrations": registrations,
             "validator_permits": parent_info.get('validator_permits', []),
             "subnet_hotkey_alpha": subnet_hotkey_alpha
@@ -254,9 +251,8 @@ class ValidatorsShovel(ShovelBaseClass):
         self.starting_block = FIRST_DTAO_BLOCK
 
     def process_block(self, n):
-        # if n % 7200 != 0:
-        #     logging.info(f"Skipping block {n}")
-        #     return
+        if n % 7200 != 0:
+            return
         try:
             logging.info(f"Processing block {n}")
             substrate = get_substrate_client()
@@ -280,11 +276,9 @@ class ValidatorsShovel(ShovelBaseClass):
             validators = get_active_validators(substrate, block_hash, delegate_info)
             logging.info(f"Found {len(validators)} active validators")
 
-            # Get subnet UIDs for querying child keys
             subnet_uids = get_subnet_uids(substrate, block_hash)
             logging.info(f"Found {len(subnet_uids)} subnets")
 
-            # Discover child keys for each validator
             child_key_validators = []
             for validator_address in validators:
                 validator_info = next((d for d in delegate_info if decode_account_id(d['delegate_ss58']) == validator_address), None)
@@ -293,7 +287,6 @@ class ValidatorsShovel(ShovelBaseClass):
                         child_keys = get_child_keys_for_validator(substrate, validator_address, net_uid, block_hash)
                         for child_hotkey, child_take in child_keys:
                             child_key_validators.append((child_hotkey, validator_address))
-                            logging.info(f"Found child key {child_hotkey} for parent {validator_address} in subnet {net_uid}")
                             if len(child_key_validators) >= 20:
                                 break
                         if len(child_key_validators) >= 20:
@@ -303,28 +296,20 @@ class ValidatorsShovel(ShovelBaseClass):
 
             logging.info(f"Found {len(child_key_validators)} child key validators")
 
-            # Combine all validators to process
             all_validators_to_process = [(addr, None) for addr in validators] + child_key_validators
             logging.info(f"Total validators to process: {len(all_validators_to_process)}")
 
             successful_inserts = 0
             for idx, (validator_address, parent_address) in enumerate(all_validators_to_process, 1):
                 try:
-                    logging.info(f"Processing validator {idx}/{len(all_validators_to_process)}: {validator_address}")
-
                     if parent_address:
+                        # This is a child key validator
                         info = fetch_validator_info(substrate, validator_address, block_hash, delegate_info)
-                        logging.info(f"-----> Got parent validator info for child {validator_address}: name={info['name']}, owner={info['owner']}")
-
                         stats = fetch_validator_stats_for_child(substrate, validator_address, parent_address, block_hash, delegate_info)
-                        logging.info(f"Got child validator stats for {validator_address}: registrations={stats['registrations']}")
                     else:
                         # This is a regular validator
                         info = fetch_validator_info(substrate, validator_address, block_hash, delegate_info)
-                        logging.info(f"Got validator info for {validator_address}: name={info['name']}, owner={info['owner']}")
-
                         stats = fetch_validator_stats(substrate, validator_address, block_hash, delegate_info)
-                        logging.info(f"Got validator stats for {validator_address}: nominators={stats['nominators']}, registrations={stats['registrations']}")
 
                     def escape_string(s):
                         if s is None:
