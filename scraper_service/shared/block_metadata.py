@@ -26,8 +26,8 @@ def get_block_timestamp(n, block_hash):
     """
     First tries to fetch from cache, then chain.
     """
-    if n not in timestamps:
-        refresh_timestamp_dict(n)
+    # if n not in timestamps:
+    #     refresh_timestamp_dict(n)
 
     if n in timestamps:
         substrate = get_substrate_client()
