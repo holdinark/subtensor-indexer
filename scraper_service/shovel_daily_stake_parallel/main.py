@@ -696,7 +696,7 @@ def ss58_decode(address: str) -> bytes:
 
 
 def main():
-    StakeDailyMapShovel(name="stake_daily_map").start()
+    StakeDailyMapShovel(name="stake_daily_map_2").start()
 
 
 if __name__ == "__main__":
