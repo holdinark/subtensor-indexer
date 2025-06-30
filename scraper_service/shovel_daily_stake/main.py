@@ -1,21 +1,26 @@
 import logging
 import time
+import struct
+from typing import Dict, List, Tuple, Optional
+import hashlib
 
 from shared.block_metadata import get_block_metadata
 from shared.clickhouse.batch_insert import buffer_insert
 from shared.clickhouse.utils import get_clickhouse_client, table_exists
 from shared.shovel_base_class import ShovelBaseClass
-from substrate import get_substrate_client, reconnect_substrate
+from shared.substrate import get_substrate_client, reconnect_substrate
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 from shared.utils import convert_address_to_ss58
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(process)d %(message)s")
 
-BLOCKS_PER_DAY = 7200
-FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5004000
+BLOCKS_PER_10_MINUTES = (60/12 * 10)
+FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5680799
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds
+SS58_FORMAT = 42  # Substrate generic format
+U64F64_SCALE = 2**64  # For U64F64 fixed point type
 
 def _retry_on_disconnect(func, *args, **kwargs):
     """Call substrate function with automatic reconnect on Broken pipe / connection reset."""
@@ -42,7 +47,7 @@ class StakeDailyMapShovel(ShovelBaseClass):
 
 
 def do_process_block(n, table_name):
-    if n % BLOCKS_PER_DAY != 0:
+    if n % BLOCKS_PER_10_MINUTES != 0:
         return
     try:
         try:
@@ -70,7 +75,7 @@ def do_process_block(n, table_name):
             raise ShovelProcessingError(f"Failed to get block metadata: {str(e)}")
 
         try:
-            rows_inserted = fetch_all_stakes_at_block(block_hash, n, block_timestamp, table_name)
+            rows_inserted = fetch_all_stakes_at_block_optimized_v2(block_hash, n, block_timestamp, table_name)
         except Exception as e:
             raise ShovelProcessingError(f"Failed to fetch stakes from substrate: {str(e)}")
 
@@ -84,147 +89,416 @@ def do_process_block(n, table_name):
         raise ShovelProcessingError(f"Unexpected error processing block {n}: {str(e)}")
 
 
-def _extract_int(value_obj):
-    """Extract integer from substrate result (int/str/hex/dict)."""
-    if value_obj is None:
+def decode_u64(data: bytes) -> int:
+    """Decode a u64 from SCALE encoded bytes."""
+    if len(data) < 8:
         return 0
-    if isinstance(value_obj, int):
-        return value_obj
-    if isinstance(value_obj, str):
+    return struct.unpack('<Q', data[:8])[0]
+
+
+def decode_u64f64(data: bytes) -> float:
+    """Decode a U64F64 fixed point number from SCALE encoded bytes."""
+    if len(data) < 16:
+        return 0.0
+    # U64F64 is stored as u128 where upper 64 bits are integer part
+    # Substrate stores it as little-endian
+    fractional_part = struct.unpack('<Q', data[:8])[0]
+    integer_part = struct.unpack('<Q', data[8:16])[0]
+    return float(integer_part) + float(fractional_part) / U64F64_SCALE
+
+
+def decode_account_id(data: bytes) -> str:
+    """Decode an AccountId to SS58 address."""
+    if len(data) >= 32:
+        return convert_address_to_ss58(data[:32], 'account')
+    return data.hex()
+
+
+def extract_storage_key_parts(storage_key: str) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+    """Extract hotkey, coldkey, and netuid from an Alpha storage key."""
+    try:
+        # Storage keys for Alpha are:
+        # module_hash + method_hash + blake2_concat(hotkey) + blake2_concat(coldkey) + identity(netuid)
+        key_data = bytes.fromhex(storage_key[2:])  # Remove '0x'
+
+        # Skip module hash (16 bytes) + storage hash (16 bytes)
+        offset = 32
+
+        # For Blake2_128Concat, we have 16 bytes hash + 32 bytes data
+        # Extract hotkey (skip 16 byte hash, then 32 bytes data)
+        offset += 16  # Skip blake2 hash
+        hotkey_raw = key_data[offset:offset+32]
+        hotkey = decode_account_id(hotkey_raw)
+        offset += 32
+
+        # Extract coldkey (skip 16 byte hash, then 32 bytes data)
+        offset += 16  # Skip blake2 hash
+        coldkey_raw = key_data[offset:offset+32]
+        coldkey = decode_account_id(coldkey_raw)
+        offset += 32
+
+        # Extract netuid (u16, identity encoding - no hash)
+        if offset + 2 <= len(key_data):
+            netuid = struct.unpack('<H', key_data[offset:offset+2])[0]
+        else:
+            netuid = 0
+
+        return hotkey, coldkey, netuid
+    except Exception as e:
+        logging.error(f"Error extracting key parts from {storage_key[:20]}...: {e}")
+        return None, None, None
+
+
+def fetch_alpha_to_tao_rates(block_number: int, block_hash: str) -> Dict[int, float]:
+    """
+    Fetch alpha_to_tao rates for all subnets at a given block.
+    First tries to fetch from the database, then falls back to chain queries.
+    Returns a dict mapping netuid -> alpha_to_tao rate.
+    """
+    try:
+        query = f"""
+        SELECT netuid, alpha_to_tao
+        FROM shovel_alpha_to_tao
+        WHERE block_number IN ({block_number}, {block_number - 1})
+        ORDER BY block_number DESC
+        """
+
         try:
-            return int(value_obj, 16) if value_obj.startswith('0x') else int(value_obj)
-        except Exception:
-            return 0
-    if isinstance(value_obj, dict):
-        if 'bits' in value_obj:
-            return _extract_int(value_obj['bits'])
-        if 'value' in value_obj:
-            return _extract_int(value_obj['value'])
-    try:
-        return int(value_obj)
-    except Exception:
-        return 0
+            result = get_clickhouse_client().execute(query)
+            if result:
+                alpha_rates = {}
+                for row in result:
+                    netuid, alpha_to_tao = row
+                    if netuid not in alpha_rates:
+                        alpha_rates[netuid] = alpha_to_tao
 
+                if alpha_rates:
+                    logging.info(f"Block {block_number}: Fetched {len(alpha_rates)} alpha_to_tao rates from database")
+                    return alpha_rates
+        except Exception as e:
+            logging.warning(f"Block {block_number}: Failed to fetch alpha_to_tao from database: {e}")
 
-def _fixed128_to_float(bits_int: int) -> float:
-    MASK64 = (1 << 64) - 1
-    int_part = bits_int >> 64
-    frac_part = bits_int & MASK64
-    return float(int_part) + float(frac_part) / 2 ** 64
-
-
-def _query_int(substrate, func, params, block_hash):
-    res = _retry_on_disconnect(substrate.query,
-        'SubtensorModule',
-        func,
-        params,
-        block_hash=block_hash
-    )
-    return _extract_int(res.value if hasattr(res, 'value') else res)
-
-
-def _query_fixed_float(substrate, func, params, block_hash):
-    bits = _query_int(substrate, func, params, block_hash)
-    return _fixed128_to_float(bits)
-
-
-def fetch_all_stakes_at_block(block_hash, block_number, block_timestamp, table_name):
-    """Stream stakes from chain and insert directly into ClickHouse buffer, return rows inserted."""
-    try:
+        logging.info(f"Block {block_number}: Fetching alpha_to_tao rates from chain...")
         substrate = get_substrate_client()
+        alpha_rates = {}
 
-        # Cache: per (netuid, hotkey) -> (hotkey_alpha_int, total_hotkey_shares_float)
-        hotkey_metrics_cache = {}
-
-        active_subnets = _retry_on_disconnect(substrate.query_map, 'SubtensorModule', 'NetworksAdded', block_hash=block_hash)
-        netuids = [_extract_int(net[0]) for net in active_subnets]
-
-        print(f"Active subnets amount: {len(netuids)}")
-
-        # Full StakingHotkeys map (coldkey -> Vec<hotkey>)
-        staking_entries_q = _retry_on_disconnect(
+        networks_added = _retry_on_disconnect(
             substrate.query_map,
-            module='SubtensorModule',
-            storage_function='StakingHotkeys',
-            block_hash=block_hash,
-            page_size=1000,
+            'SubtensorModule',
+            'NetworksAdded',
+            block_hash=block_hash
         )
-        staking_entries = list(staking_entries_q)
+        networks = [int(net[0].value) for net in networks_added]
 
-        print(f"Staking entries amount: {len(staking_entries)}")
+        for netuid in networks:
+            subnet_tao = _retry_on_disconnect(
+                substrate.query,
+                'SubtensorModule',
+                'SubnetTAO',
+                [netuid],
+                block_hash=block_hash
+            ).value / 1e9
 
-        if len(staking_entries) == 0:
-            raise ShovelProcessingError('No StakingHotkeys data returned')
+            subnet_alpha_in = _retry_on_disconnect(
+                substrate.query,
+                'SubtensorModule',
+                'SubnetAlphaIn',
+                [netuid],
+                block_hash=block_hash
+            ).value / 1e9
 
-        rows_inserted = 0
+            alpha_to_tao = 1 if netuid == 0 else (subnet_tao / subnet_alpha_in if subnet_alpha_in > 0 else 0)
+            alpha_rates[netuid] = alpha_to_tao
 
-        def to_ss58(raw_addr, addr_type):
-            try:
-                return convert_address_to_ss58(raw_addr, addr_type)
-            except Exception:
-                return None
+        logging.info(f"Block {block_number}: Fetched {len(alpha_rates)} alpha_to_tao rates from chain")
+        return alpha_rates
 
-        def get_hotkey_metrics(netuid, hotkey_address):
-            key = (netuid, hotkey_address)
-            if key in hotkey_metrics_cache:
-                return hotkey_metrics_cache[key]
-            hotkey_alpha_int = _query_int(substrate, 'TotalHotkeyAlpha', [hotkey_address, netuid], block_hash)
-            total_hotkey_shares_float = _query_fixed_float(substrate, 'TotalHotkeyShares', [hotkey_address, netuid], block_hash)
-            hotkey_metrics_cache[key] = (hotkey_alpha_int, total_hotkey_shares_float)
-            return hotkey_metrics_cache[key]
+    except Exception as e:
+        logging.error(f"Block {block_number}: Failed to fetch alpha_to_tao rates: {e}")
+        raise ShovelProcessingError(f"Failed to fetch alpha_to_tao rates: {str(e)}")
 
-        for idx, entry in enumerate(staking_entries):
-            if idx % 1000 == 0:
-                logging.debug(f'Streaming StakingHotkeys entry {idx+1}/{len(staking_entries)}')
-            try:
-                coldkey_raw = entry[0]
-                hotkeys_raw_list = entry[1]
-                coldkey_ss58 = to_ss58(coldkey_raw, 'coldkey')
-                if not coldkey_ss58 or not hotkeys_raw_list:
-                    continue
-                if hasattr(hotkeys_raw_list, 'value'):
-                    hotkeys_raw_list = hotkeys_raw_list.value
+def fetch_all_stakes_at_block_optimized_v2(block_hash, block_number, block_timestamp, table_name):
+    """
+    Alternative implementation that fetches all data upfront with prefix queries.
+    """
+    start_time = time.time()
+    substrate = get_substrate_client()
+    rows_inserted = 0
 
-                for hotkey_raw_container in hotkeys_raw_list:
-                    hotkey_raw = hotkey_raw_container
-                    if isinstance(hotkey_raw, (tuple, list)) and len(hotkey_raw) == 1 and isinstance(hotkey_raw[0], (tuple, list)):
-                        hotkey_raw = hotkey_raw[0]
-                    hotkey_ss58 = to_ss58(hotkey_raw, 'hotkey')
-                    if not hotkey_ss58:
-                        print(f"Hotkey ss58 is None: {hotkey_raw}")
-                        continue
+    try:
+        # Fetch alpha_to_tao rates for all subnets once at the beginning
+        alpha_to_tao_rates = fetch_alpha_to_tao_rates(block_number, block_hash)
 
-                    for netuid in netuids:
-                        alpha_share_float = _query_fixed_float(substrate, 'Alpha', [hotkey_ss58, coldkey_ss58, netuid], block_hash)
-                        if alpha_share_float == 0:
-                            continue
-                        hotkey_alpha_int, total_hotkey_shares_float = get_hotkey_metrics(netuid, hotkey_ss58)
-                        if total_hotkey_shares_float == 0:
-                            print(f"Total hotkey shares float is 0: {total_hotkey_shares_float}")
-                            continue
-                        stake_tao = int(alpha_share_float * hotkey_alpha_int / total_hotkey_shares_float)
-                        alpha_int = int(alpha_share_float)
+        # Step 1: Get all Alpha entries using pagination
+        logging.info(f"Block {block_number}: Fetching all Alpha storage keys...")
+        alpha_prefix = substrate.create_storage_key(
+            pallet="SubtensorModule",
+            storage_function="Alpha"
+        ).to_hex()[:66]  # Get just the prefix part
 
-                        buffer_insert(
-                            table_name,
-                            [
-                                block_number,
-                                block_timestamp,
-                                f"'{coldkey_ss58}'",
-                                f"'{hotkey_ss58}'",
-                                netuid,
-                                stake_tao,
-                                alpha_int,
-                            ],
-                        )
-                        rows_inserted += 1
-            except Exception as exc:
-                logging.warning(f'Error streaming staking entry #{idx}: {exc}')
-                continue
+        # Fetch keys in pages
+        all_alpha_keys = []
+        page_size = 1000
+        start_key = None
+
+        while True:
+            if start_key:
+                result = substrate.rpc_request(
+                    method="state_getKeysPaged",
+                    params=[alpha_prefix, page_size, start_key, block_hash]
+                )
+            else:
+                result = substrate.rpc_request(
+                    method="state_getKeysPaged",
+                    params=[alpha_prefix, page_size, alpha_prefix, block_hash]
+                )
+
+            keys = result.get('result', [])
+            if not keys:
+                break
+
+            all_alpha_keys.extend(keys)
+            logging.info(f"Block {block_number}: Fetched {len(all_alpha_keys)} Alpha keys so far...")
+
+            if len(keys) < page_size:
+                break
+
+            start_key = keys[-1]
+
+        logging.info(f"Block {block_number}: Found {len(all_alpha_keys)} Alpha entries total")
+
+        if not all_alpha_keys:
+            logging.warning(f"Block {block_number}: No Alpha entries found")
+            return 0
+
+        # Step 2: Fetch ALL TotalHotkeyAlpha entries upfront
+        logging.info(f"Block {block_number}: Fetching all TotalHotkeyAlpha entries...")
+        total_alpha_prefix = substrate.create_storage_key(
+            pallet="SubtensorModule",
+            storage_function="TotalHotkeyAlpha"
+        ).to_hex()[:66]
+
+        total_alpha_map = {}
+        start_key = None
+
+        while True:
+            if start_key:
+                result = substrate.rpc_request(
+                    method="state_getKeysPaged",
+                    params=[total_alpha_prefix, page_size, start_key, block_hash]
+                )
+            else:
+                result = substrate.rpc_request(
+                    method="state_getKeysPaged",
+                    params=[total_alpha_prefix, page_size, total_alpha_prefix, block_hash]
+                )
+
+            keys = result.get('result', [])
+            if not keys:
+                break
+
+            # Batch fetch values
+            for i in range(0, len(keys), 1000):
+                chunk_keys = keys[i:i + 1000]
+                response = substrate.rpc_request(
+                    method="state_queryStorageAt",
+                    params=[chunk_keys, block_hash]
+                ).get('result', [])
+
+                if response and len(response) > 0:
+                    changes = response[0].get('changes', [])
+                    for key, value in changes:
+                        if value:
+                            # Extract hotkey and netuid from the key
+                            key_bytes = bytes.fromhex(key[2:])
+                            # Storage key structure:
+                            # - Module hash: 16 bytes (0-16)
+                            # - Storage hash: 16 bytes (16-32)
+                            # - Hotkey (Blake2_128Concat): 16 bytes hash (32-48) + 32 bytes data (48-80)
+                            # - Netuid (Identity): 2 bytes (80-82)
+
+                            if len(key_bytes) >= 82:
+                                hotkey_raw = key_bytes[48:80]
+                                hotkey = decode_account_id(hotkey_raw)
+                                netuid = struct.unpack('<H', key_bytes[80:82])[0]
+
+                                value_bytes = bytes.fromhex(value[2:])
+                                total_alpha_map[(hotkey, netuid)] = decode_u64(value_bytes)
+                            else:
+                                logging.warning(f"Block {block_number}: Key too short: {len(key_bytes)} bytes")
+
+            logging.info(f"Block {block_number}: Fetched {len(total_alpha_map)} TotalHotkeyAlpha entries...")
+
+            if len(keys) < page_size:
+                break
+            start_key = keys[-1]
+
+        # Step 3: Fetch ALL TotalHotkeyShares entries upfront
+        logging.info(f"Block {block_number}: Fetching all TotalHotkeyShares entries...")
+        total_shares_prefix = substrate.create_storage_key(
+            pallet="SubtensorModule",
+            storage_function="TotalHotkeyShares"
+        ).to_hex()[:66]
+
+        total_shares_map = {}
+        start_key = None
+
+        while True:
+            if start_key:
+                result = substrate.rpc_request(
+                    method="state_getKeysPaged",
+                    params=[total_shares_prefix, page_size, start_key, block_hash]
+                )
+            else:
+                result = substrate.rpc_request(
+                    method="state_getKeysPaged",
+                    params=[total_shares_prefix, page_size, total_shares_prefix, block_hash]
+                )
+
+            keys = result.get('result', [])
+            if not keys:
+                break
+
+            # Batch fetch values
+            for i in range(0, len(keys), 1000):
+                chunk_keys = keys[i:i + 1000]
+                response = substrate.rpc_request(
+                    method="state_queryStorageAt",
+                    params=[chunk_keys, block_hash]
+                ).get('result', [])
+
+                if response and len(response) > 0:
+                    changes = response[0].get('changes', [])
+                    for key, value in changes:
+                        if value:
+                            # Extract hotkey and netuid from the key
+                            key_bytes = bytes.fromhex(key[2:])
+                            # Storage key structure:
+                            # - Module hash: 16 bytes (0-16)
+                            # - Storage hash: 16 bytes (16-32)
+                            # - Hotkey (Blake2_128Concat): 16 bytes hash (32-48) + 32 bytes data (48-80)
+                            # - Netuid (Identity): 2 bytes (80-82)
+
+                            if len(key_bytes) >= 82:
+                                hotkey_raw = key_bytes[48:80]
+                                hotkey = decode_account_id(hotkey_raw)
+                                netuid = struct.unpack('<H', key_bytes[80:82])[0]
+
+                                value_bytes = bytes.fromhex(value[2:])
+                                total_shares_map[(hotkey, netuid)] = decode_u64f64(value_bytes)
+                            else:
+                                logging.warning(f"Block {block_number}: Key too short: {len(key_bytes)} bytes")
+
+            logging.info(f"Block {block_number}: Fetched {len(total_shares_map)} TotalHotkeyShares entries...")
+
+            if len(keys) < page_size:
+                break
+            start_key = keys[-1]
+
+        # Step 4: Process Alpha entries and calculate stakes
+        logging.info(f"Block {block_number}: Processing Alpha entries and calculating stakes...")
+
+        # Batch query Alpha values
+        for i in range(0, len(all_alpha_keys), 1000):
+            chunk_keys = all_alpha_keys[i:i + 1000]
+            response = substrate.rpc_request(
+                method="state_queryStorageAt",
+                params=[chunk_keys, block_hash]
+            ).get('result', [])
+
+            if response and len(response) > 0:
+                changes = response[0].get('changes', [])
+                for key, value in changes:
+                    if value:
+                        hotkey, coldkey, netuid = extract_storage_key_parts(key)
+                        if hotkey and coldkey and netuid is not None:
+                            value_bytes = bytes.fromhex(value[2:])
+                            alpha_share = decode_u64f64(value_bytes)
+
+                            if alpha_share > 0:
+                                total_alpha = total_alpha_map.get((hotkey, netuid), 0)
+                                total_shares = total_shares_map.get((hotkey, netuid), 0)
+
+                                if total_shares > 0:
+                                    total_alpha_stake = int(alpha_share * total_alpha / total_shares)
+                                    alpha_to_tao = alpha_to_tao_rates.get(netuid, 0)
+                                    tao_stake = total_alpha_stake * alpha_to_tao
+
+                                    buffer_insert(
+                                        table_name,
+                                        [
+                                            block_number,
+                                            block_timestamp,
+                                            f"'{coldkey}'",
+                                            f"'{hotkey}'",
+                                            netuid,
+                                            tao_stake,
+                                            total_alpha_stake,
+                                        ],
+                                    )
+                                    rows_inserted += 1
+
+                                    if rows_inserted % 10000 == 0:
+                                        logging.info(f"Block {block_number}: Inserted {rows_inserted} rows...")
+
+            logging.info(f"Block {block_number}: Processed {min(i + 1000, len(all_alpha_keys))}/{len(all_alpha_keys)} Alpha entries...")
+
+        elapsed_time = time.time() - start_time
+        logging.info(
+            f"Block {block_number}: Completed in {elapsed_time:.2f} seconds. "
+            f"Inserted {rows_inserted} rows. "
+            f"Rate: {rows_inserted / elapsed_time:.1f} rows/sec"
+        )
+
         return rows_inserted
 
     except Exception as e:
+        logging.error(f"Error in optimized fetch v2 for block {block_number}: {e}")
         raise ShovelProcessingError(f'Error fetching stakes: {str(e)}')
+
+
+def fast_storage_key(pallet: str, storage_function: str, params: list) -> str:
+    """
+    Manually construct storage key without using substrate.create_storage_key()
+    which can be very slow.
+    """
+    # Hash the pallet name
+    pallet_hash = hashlib.blake2b(pallet.encode(), digest_size=16).digest()
+
+    # Hash the storage function name
+    storage_hash = hashlib.blake2b(storage_function.encode(), digest_size=16).digest()
+
+    # Start with pallet and storage hashes
+    key = pallet_hash + storage_hash
+
+    # For TotalHotkeyAlpha and TotalHotkeyShares, we have:
+    # - First param (hotkey): Blake2_128Concat
+    # - Second param (netuid): Identity
+
+    if len(params) >= 1:
+        # First parameter (hotkey) - Blake2_128Concat
+        hotkey_bytes = bytes.fromhex(params[0][2:]) if params[0].startswith('0x') else ss58_decode(params[0])
+        hotkey_hash = hashlib.blake2b(hotkey_bytes, digest_size=16).digest()
+        key += hotkey_hash + hotkey_bytes
+
+    if len(params) >= 2:
+        # Second parameter (netuid) - Identity encoding (just the value)
+        netuid = params[1]
+        key += netuid.to_bytes(2, 'little')
+
+    return '0x' + key.hex()
+
+
+def ss58_decode(address: str) -> bytes:
+    """Decode SS58 address to bytes."""
+    try:
+        from substrateinterface.utils.ss58 import ss58_decode as substrate_ss58_decode
+        return bytes.fromhex(substrate_ss58_decode(address))
+    except:
+        # Fallback simple implementation
+        import base58
+        decoded = base58.b58decode(address)
+        return decoded[1:-2]  # Remove prefix and checksum
 
 
 def main():
