@@ -15,7 +15,20 @@ from shared.utils import convert_address_to_ss58
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(process)d %(message)s")
 
-BLOCKS_PER_10_MINUTES = (60/12 * 10)
+SECONDS_PER_BLOCK = 12
+BLOCKS_PER_MINUTE = 60 // SECONDS_PER_BLOCK
+BLOCKS_PER_10_MINUTES = BLOCKS_PER_MINUTE * 10
+BLOCKS_PER_HOUR = BLOCKS_PER_MINUTE * 60
+BLOCKS_PER_DAY = BLOCKS_PER_HOUR * 24
+BLOCKS_PER_MONTH_30 = BLOCKS_PER_DAY * 30
+BLOCKS_PER_MONTH_31 = BLOCKS_PER_DAY * 31
+
+JULY_START = 5911091
+JUNE_START = JULY_START - BLOCKS_PER_MONTH_30
+MAY_START = JUNE_START - BLOCKS_PER_MONTH_31
+APRIL_START = MAY_START - BLOCKS_PER_MONTH_30
+MARCH_START = APRIL_START - BLOCKS_PER_MONTH_31
+
 FIRST_BLOCK_WITH_NEW_STAKING_MECHANISM = 5680799
 MAX_RETRIES = 3
 RETRY_BASE_DELAY = 2  # seconds
@@ -46,8 +59,29 @@ class StakeDailyMapShovel(ShovelBaseClass):
         do_process_block(n, self.table_name)
 
 
+def should_process_block(block_number):
+    """
+    Determine if a block should be processed based on the fetch frequency schedule:
+    - Before February: Twice a day (every 12 hours)
+    - February & March: Twice a day (every 12 hours)
+    - April & May: 12 times a day (every 2 hours)
+    - June: Every hour
+    - July onwards: Every 10 minutes
+    """
+    if block_number < APRIL_START:
+        return block_number % (BLOCKS_PER_DAY // 2) == 0
+    elif block_number < MAY_START:
+        return block_number % (BLOCKS_PER_HOUR * 2) == 0
+    elif block_number < JUNE_START:
+        return block_number % (BLOCKS_PER_HOUR * 2) == 0
+    elif block_number < JULY_START:
+        return block_number % BLOCKS_PER_HOUR == 0
+    else:
+        return block_number % BLOCKS_PER_10_MINUTES == 0
+
+
 def do_process_block(n, table_name):
-    if n % BLOCKS_PER_10_MINUTES != 0:
+    if not should_process_block(n):
         return
     try:
         try:
