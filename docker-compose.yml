@@ -3,17 +3,17 @@ services:
     image: clickhouse/clickhouse-server:24.5.5.36-alpine
     container_name: clickhouse
     ports:
-      - "8123:8123" # HTTP interface for ClickHouse
-      - "9000:9000" # Native client interface for ClickHouse
+      - '8123:8123' # HTTP interface for ClickHouse
+      - '9000:9000' # Native client interface for ClickHouse
     volumes:
       - clickhouse_data:/var/lib/clickhouse
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     ulimits:
@@ -34,15 +34,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_extrinsics:
@@ -56,15 +56,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_events:
@@ -78,15 +78,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_stake_map:
@@ -100,15 +100,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_stake_map_test_copy:
@@ -122,15 +122,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_hotkey_owner_map:
@@ -144,15 +144,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_subnets:
@@ -166,15 +166,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: always
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_daily_stake:
@@ -188,15 +188,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_daily_balance:
@@ -210,15 +210,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_tao_price:
@@ -232,15 +232,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_alpha_to_tao:
@@ -254,15 +254,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_validators:
@@ -276,15 +276,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   shovel_subnet_stats:
@@ -298,15 +298,15 @@ services:
     env_file:
       - .env
     logging:
-      driver: "json-file"
+      driver: 'json-file'
       options:
-        max-size: "10m"
-        max-file: "3"
+        max-size: '10m'
+        max-file: '3'
     networks:
       - app_network
     restart: on-failure
     extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - 'host.docker.internal:host-gateway'
     tty: true
 
   # shovel_balance_map:
