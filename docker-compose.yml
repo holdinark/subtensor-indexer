@@ -111,6 +111,28 @@ services:
       - 'host.docker.internal:host-gateway'
     tty: true
 
+  shovel_stake_map_test_copy:
+    build:
+      context: ./scraper_service
+      dockerfile: ./shovel_stake_map_test_copy/Dockerfile
+    container_name: shovel_stake_map_test_copy
+    depends_on:
+      clickhouse:
+        condition: service_started
+    env_file:
+      - .env
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '10m'
+        max-file: '3'
+    networks:
+      - app_network
+    restart: on-failure
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    tty: true
+
   shovel_hotkey_owner_map:
     build:
       context: ./scraper_service

@@ -1,0 +1,27 @@
+# Set default behavior to automatically normalize line endings
+* text=auto
+
+# Force Unix line endings for specific file types
+*.py text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.rs text eol=lf
+*.sh text eol=lf
+Dockerfile* text eol=lf
+*.dockerignore text eol=lf
+
+# Binary files should be left untouched
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+
+# Cargo.lock should always have LF line endings
+Cargo.lock text eol=lf
