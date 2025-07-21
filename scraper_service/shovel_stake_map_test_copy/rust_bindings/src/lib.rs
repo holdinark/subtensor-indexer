@@ -82,6 +82,7 @@ async fn query_hotkey_stakes_inner(
         .storage()
         .at(block_hash.clone())
         .iter(query)
+        .await
     {
         Ok(it) => it,
         Err(_) => return Vec::new(),
