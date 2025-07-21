@@ -29,12 +29,12 @@ class ShovelBaseClass:
         self.name = name
         self.skip_interval = skip_interval
         self.starting_block = 0  # Default value, can be overridden by subclasses
-        
+
         # Initialize telemetry with shovel name as fallback service name
         tracer, meter = init_telemetry(fallback_name=f"shovel-{self.name}")
         if tracer:
             logging.info(f"Telemetry initialized for shovel: {self.name}")
-        
+
         # Get metrics instance
         self.metrics = get_metrics()
 
@@ -42,7 +42,7 @@ class ShovelBaseClass:
     def start(self):
         """Start the shovel processing loop."""
         self._start_internal()
-    
+
     def _start_internal(self):
         retry_count = 0
         while True:
@@ -56,7 +56,7 @@ class ShovelBaseClass:
                         last_scraped_block_number = self._process_blocks_cycle(
                             last_scraped_block_number, finalized_block_number, substrate
                         )
-                        
+
                         # Reset retry count on successful iteration
                         retry_count = 0
 
@@ -136,14 +136,14 @@ class ShovelBaseClass:
         last_scraped_block_number = self.get_checkpoint()
         finalized_block_hash = substrate.get_chain_finalised_head()
         finalized_block_number = substrate.get_block_number(finalized_block_hash)
-        
+
         return last_scraped_block_number
 
     @trace_method("shovel.process_block_batch")
     def _process_block_batch(self, block_numbers):
         """Process a batch of blocks."""
         batch_start_time = time()
-        
+
         # Add batch metadata to current span
         tracer = get_tracer()
         if tracer:
@@ -152,14 +152,14 @@ class ShovelBaseClass:
                 span.set_attribute("block_count", len(block_numbers))
                 span.set_attribute("start_block", block_numbers[0])
                 span.set_attribute("end_block", block_numbers[-1])
-        
+
         for block_number in tqdm(block_numbers):
             self._process_single_block(block_number)
-        
+
         # Record batch processing time
         batch_duration = time() - batch_start_time
         self.metrics.record_batch_processing_time(
-            batch_duration, 
+            batch_duration,
             shovel_name=self.name,
             block_count=len(block_numbers)
         )
@@ -168,42 +168,42 @@ class ShovelBaseClass:
     def _process_single_block(self, block_number):
         """Process a single block with error handling and metrics."""
         block_start_time = time()
-        
+
         # Add block number to current span
         tracer = get_tracer()
         if tracer:
             span = tracer.get_current_span()
             if span:
                 span.set_attribute("block_number", block_number)
-        
+
         # Update current block metric
         self.metrics.set_current_block(block_number, shovel_name=self.name)
-        
+
         try:
             self.process_block(block_number)
             self.checkpoint_block_number = block_number
-            
+
             # Record successful processing
             block_duration = time() - block_start_time
             self.metrics.record_block_processing_time(
-                block_duration, 
+                block_duration,
                 shovel_name=self.name,
                 block_number=block_number,
                 status="success"
             )
             self.metrics.increment_blocks_processed(
-                1, 
+                1,
                 shovel_name=self.name,
                 status="success"
             )
-            
+
             # Mark successful processing in span
             if tracer:
                 span = tracer.get_current_span()
                 if span:
                     span.set_attribute("processing_successful", True)
                     span.set_attribute("processing_duration_seconds", block_duration)
-                    
+
         except DatabaseConnectionError as e:
             self._record_error("database_connection", block_number, str(e))
             self.metrics.increment_database_errors(1, shovel_name=self.name, error_type="connection")
@@ -217,7 +217,7 @@ class ShovelBaseClass:
     def _record_error(self, error_type, block_number, message, exception_type=None):
         """Record error information in telemetry."""
         logging.error(f"{error_type.replace('_', ' ').title()} error while processing block {block_number}: {message}")
-        
+
         tracer = get_tracer()
         if tracer:
             span = tracer.get_current_span()
@@ -236,7 +236,7 @@ class ShovelBaseClass:
 
         logging.warning(f"Database connection error (attempt {retry_count}/{self.MAX_RETRIES}): {str(error)}")
         logging.info(f"Retrying in {self.RETRY_DELAY} seconds...")
-        
+
         self._retry_delay(retry_count)
         return retry_count
 
@@ -249,20 +249,20 @@ class ShovelBaseClass:
             if span:
                 span.set_attribute("retry_count", retry_count)
                 span.set_attribute("delay_seconds", self.RETRY_DELAY)
-        
+
         sleep(self.RETRY_DELAY)
         reconnect_substrate()
 
     def _handle_fatal_error(self, error_type, message):
         """Handle fatal errors and exit."""
         logging.error(f"Fatal shovel error: {message}")
-        
+
         tracer = get_tracer()
         if tracer:
             with tracer.start_as_current_span("shovel.fatal_error") as span:
                 span.set_attribute("error.type", error_type)
                 span.set_attribute("error.message", message)
-        
+
         sys.exit(1)
 
     def process_block(self, n):
@@ -284,7 +284,7 @@ class ShovelBaseClass:
 
         # Record database insertion metrics
         self.metrics.increment_records_inserted(
-            rows, 
+            rows,
             shovel_name=self.name,
             tables_count=tables,
             block_number=self.last_buffer_flush_call_block_number
@@ -303,7 +303,7 @@ class ShovelBaseClass:
                 span.set_attribute("block_number", self.last_buffer_flush_call_block_number)
                 span.set_attribute("rows_flushed", rows)
                 span.set_attribute("tables_updated", tables)
-        
+
         self._update_checkpoint()
 
     @trace("shovel.database.update_checkpoint")
