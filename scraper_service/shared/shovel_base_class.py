@@ -12,6 +12,7 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import sys
+from opentelemetry.trace import get_current_span
 
 
 class ShovelBaseClass:
