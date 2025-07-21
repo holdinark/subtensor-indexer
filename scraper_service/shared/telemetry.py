@@ -144,6 +144,11 @@ def get_meter():
     """Convenience function to get meter."""
     return telemetry_manager.get_meter()
 
+# Helper to get current active span
+def current_span():
+    """Return the currently active span from OpenTelemetry context."""
+    return ot_trace.get_current_span()
+
 
 # =============================================================================
 # METRICS - Custom Metric Helpers
