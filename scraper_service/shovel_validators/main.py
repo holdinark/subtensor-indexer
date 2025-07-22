@@ -22,27 +22,21 @@ SS58_FORMAT = 42
 FIRST_DTAO_BLOCK = int(os.getenv("FIRST_DTAO_BLOCK", "4920351"))
 
 def decode_account_id(account_id_bytes: Union[tuple[int], tuple[tuple[int]]]):
-    # Handle BittensorScaleType objects
     if hasattr(account_id_bytes, 'value'):
         account_id_bytes = account_id_bytes.value
 
-    # Handle nested tuples
     if isinstance(account_id_bytes, tuple) and len(account_id_bytes) == 1 and isinstance(account_id_bytes[0], (tuple, list)):
         account_id_bytes = account_id_bytes[0]
 
-    # Handle list of tuples
     if isinstance(account_id_bytes, list) and len(account_id_bytes) == 1 and isinstance(account_id_bytes[0], tuple):
         account_id_bytes = account_id_bytes[0]
 
-    # If it's already a string (SS58 address), return it
     if isinstance(account_id_bytes, str):
         return account_id_bytes
 
-    # Convert to bytes and encode
     try:
         return ss58_encode(bytes(account_id_bytes).hex(), SS58_FORMAT)
     except Exception as e:
-        # Log more details about the error
         logging.error(f"Failed to decode account ID: {e}, type: {type(account_id_bytes)}, value: {account_id_bytes}")
         raise
 
@@ -107,7 +101,6 @@ def get_registered_validators_in_subnet(substrate, net_uid: int, block_hash: str
         for storage_key, value in result:
             if value:
                 try:
-                    # Handle different value formats
                     if hasattr(value, 'value'):
                         account_data = value.value
                     else:
@@ -236,7 +229,6 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
         logging.error(f"Failed to fetch delegate info: {e}")
         raise
 
-    # Create delegate map for easy lookup
     delegate_map = {}
     for delegate in delegate_info:
         if 'delegate_ss58' in delegate:
@@ -246,18 +238,15 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
     subnet_uids = get_subnet_uids(substrate, block_hash)
     logging.info(f"Found {len(subnet_uids)} subnets to process")
 
-    # Track all validators and their data
     all_validators = {}  # address -> validator data
     parents_with_child_access = defaultdict(set)  # parent -> set of subnets they can access via children
     child_relationships = []  # List of (child, parent, subnet, take) tuples
 
-    # For each subnet, get registered validators and check for parents
     for net_uid in subnet_uids:
         logging.info(f"Processing subnet {net_uid}...")
         registered_validators = get_registered_validators_in_subnet(substrate, net_uid, block_hash)
 
         for validator_address in registered_validators:
-            # Initialize validator entry if not exists
             if validator_address not in all_validators:
                 all_validators[validator_address] = {
                     "address": validator_address,
@@ -269,11 +258,9 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
 
             all_validators[validator_address]["subnets"].add(net_uid)
 
-            # Get alpha for this validator
             alpha = get_total_hotkey_alpha(substrate, validator_address, net_uid, block_hash)
             all_validators[validator_address]["subnet_hotkey_alpha"][net_uid] = alpha
 
-            # Check if this validator has parents (making it a child key)
             parent_keys = get_parent_keys_for_validator(substrate, validator_address, net_uid, block_hash)
 
             if parent_keys:
@@ -284,7 +271,6 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
                     child_relationships.append((validator_address, parent_address, net_uid, parent_take))
                     logging.debug(f"Found child {validator_address} -> parent {parent_address} in subnet {net_uid}")
 
-    # Add parent validators that only have child access
     for parent_address, child_subnets in parents_with_child_access.items():
         if parent_address not in all_validators:
             all_validators[parent_address] = {
@@ -295,7 +281,6 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
                 "parent_addresses": set()
             }
 
-    # Process validators and insert directly
     successful_inserts = 0
     total_validators = 0
     regular_validators = 0
@@ -303,24 +288,18 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
 
     for address, val_data in all_validators.items():
         if address not in delegate_map:
-            # Skip validators not in delegate info
             continue
 
         total_validators += 1
         delegate = delegate_map[address]
 
-        # Fetch validator info
         info = fetch_validator_info(substrate, address, block_hash, delegate_info)
 
-        # Calculate registrations (direct registrations + child access)
         registrations = list(val_data["subnets"])
         if address in parents_with_child_access:
-            # Add subnets accessible via children
             child_access_subnets = list(parents_with_child_access[address])
-            # Merge with direct registrations
             registrations = list(set(registrations + child_access_subnets))
 
-        # Track statistics
         if val_data["is_child"]:
             child_key_validators += 1
         else:
@@ -344,11 +323,9 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
             "parent_addresses": list(val_data["parent_addresses"])
         }
 
-        # Insert validator directly
         if insert_validator(table_name, validator_data):
             successful_inserts += 1
 
-        # Log progress for important validators
         if address in ["5G3wMP3g3d775hauwmAZioYFVZYnvw6eY46wkFy8hEWD5KP3", "5HdTZQ6UXD7MWcRsMeExVwqAKKo4UwomUd662HvtXiZXkxmv"]:
             logging.info(f"Validator {address}: direct_subnets={val_data['subnets']}, child_access={parents_with_child_access.get(address, set())}, total_registrations={registrations}")
 
@@ -437,12 +414,10 @@ class ValidatorsShovel(ShovelBaseClass):
             create_validators_table(self.table_name)
             logging.info("Ensured validators table exists - ClickHouse connection successful!")
 
-            # Use the new logic - this now inserts validators directly
             successful_inserts = fetch_all_validators_data_new(substrate, block_hash, block_timestamp, n, self.table_name)
 
             logging.info(f"Successfully processed block {n}")
 
-            # Log buffer status
             if successful_inserts > 0:
                 logging.info(f"Added {successful_inserts} validators to buffer. Buffer will auto-flush based on size/time thresholds.")
 
@@ -457,15 +432,11 @@ class ValidatorsShovel(ShovelBaseClass):
     def cleanup(self):
         """Cleanup method called when the shovel is stopped."""
         logging.info("Cleaning up ValidatorsShovel...")
-        # Any cleanup logic here
         pass
 
 
 def main():
     print("Starting ValidatorsShovel...")
-    print("działam..............................................")
-    print("działam..............................................")
-    print("działam..............................................")
     print(f"Current log level: {logging.getLogger().level}")
     logging.warning("TEST: This is a warning message")
     logging.info("TEST: This is an info message")
