@@ -18,8 +18,7 @@ class BlockTimestampShovel(ShovelBaseClass):
 
     def __init__(self, name):
         super().__init__(name)
-        self.starting_block = 6000000 #int(os.getenv("FIRST_DTAO_BLOCK", "4920351"))
-
+        self.starting_block = 4920351
 
     def process_block(self, n):
         do_process_block(self, n)
