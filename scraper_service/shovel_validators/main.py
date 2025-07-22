@@ -4,20 +4,22 @@ from shared.clickhouse.utils import (
     get_clickhouse_client,
     table_exists,
 )
+from time import sleep
 from shared.shovel_base_class import ShovelBaseClass
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
-from substrate import get_substrate_client
+from substrate import get_substrate_client, reconnect_substrate
 import logging
 from typing import Dict, List, Any, Tuple
 from typing import Union
 from scalecodec.utils.ss58 import ss58_encode
 import traceback
 from collections import defaultdict
+import os
 
 set_debug_mode(True)
 
 SS58_FORMAT = 42
-FIRST_DTAO_BLOCK = 6000000 #int(os.getenv("FIRST_DTAO_BLOCK", "4920351"))
+FIRST_DTAO_BLOCK = int(os.getenv("FIRST_DTAO_BLOCK", "4920351"))
 
 def decode_account_id(account_id_bytes: Union[tuple[int], tuple[tuple[int]]]):
     # Handle BittensorScaleType objects
@@ -49,7 +51,7 @@ def decode_string(string: Union[str, tuple[int]]):
         return string
     return bytes(string).decode('utf-8')
 
-logging.basicConfig(level=logging.DEBUG,
+logging.basicConfig(level=logging.INFO,
                    format="%(asctime)s %(process)d %(levelname)s %(name)s %(message)s",
                    force=True)
 
@@ -86,7 +88,7 @@ def get_subnet_uids(substrate, block_hash: str) -> List[int]:
         )
         subnet_info = result.value
 
-        return [3] #info['netuid'] for info in subnet_info if 'netuid' in info]
+        return [info['netuid'] for info in subnet_info if 'netuid' in info]
     except Exception as e:
         logging.error(f"Failed to get subnet UIDs: {str(e)}")
         return []
@@ -218,8 +220,8 @@ def fetch_validator_info(substrate, address: str, block_hash: str, delegate_info
             "url": None
         }
 
-def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, block_number: int):
-    """Fetch all validators data using the new logic (from registered validators to parents)."""
+def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, block_number: int, table_name: str):
+    """Fetch all validators data using the new logic (from registered validators to parents) and insert directly."""
     logging.info(f"=== fetch_all_validators_data_new called for block {block_number} ===")
     logging.info("Fetching delegate info...")
     try:
@@ -293,14 +295,18 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
                 "parent_addresses": set()
             }
 
-    # Build final validator data list
-    validators_data = []
+    # Process validators and insert directly
+    successful_inserts = 0
+    total_validators = 0
+    regular_validators = 0
+    child_key_validators = 0
 
     for address, val_data in all_validators.items():
         if address not in delegate_map:
             # Skip validators not in delegate info
             continue
 
+        total_validators += 1
         delegate = delegate_map[address]
 
         # Fetch validator info
@@ -314,8 +320,11 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
             # Merge with direct registrations
             registrations = list(set(registrations + child_access_subnets))
 
-        # For validators that are children, we keep their own registrations
-        # For parent validators, we include both direct and child-accessible subnets
+        # Track statistics
+        if val_data["is_child"]:
+            child_key_validators += 1
+        else:
+            regular_validators += 1
 
         validator_data = {
             "block_number": block_number,
@@ -335,23 +344,59 @@ def fetch_all_validators_data_new(substrate, block_hash: str, block_timestamp, b
             "parent_addresses": list(val_data["parent_addresses"])
         }
 
-        validators_data.append(validator_data)
+        # Insert validator directly
+        if insert_validator(table_name, validator_data):
+            successful_inserts += 1
 
-        # Log summary for important validators
+        # Log progress for important validators
         if address in ["5G3wMP3g3d775hauwmAZioYFVZYnvw6eY46wkFy8hEWD5KP3", "5HdTZQ6UXD7MWcRsMeExVwqAKKo4UwomUd662HvtXiZXkxmv"]:
             logging.info(f"Validator {address}: direct_subnets={val_data['subnets']}, child_access={parents_with_child_access.get(address, set())}, total_registrations={registrations}")
 
-    # Count statistics
-    regular_validators = len([v for v in validators_data if not v['is_child_key']])
-    child_key_validators = len([v for v in validators_data if v['is_child_key']])
+    # Log final statistics
     parents_with_children = len(parents_with_child_access)
 
-    logging.info(f"Processed {len(validators_data)} total validators:")
+    logging.info(f"Processed {total_validators} total validators:")
     logging.info(f"- Regular validators: {regular_validators}")
     logging.info(f"- Child key validators: {child_key_validators}")
     logging.info(f"- Parents with child access: {parents_with_children}")
+    logging.info(f"- Successful inserts: {successful_inserts}")
 
-    return validators_data
+    if successful_inserts < total_validators:
+        logging.warning(f"Only {successful_inserts}/{total_validators} validators were successfully inserted")
+
+    return successful_inserts
+
+
+def insert_validator(table_name: str, validator_data: Dict[str, Any]) -> bool:
+    """Insert a single validator into ClickHouse. Returns True if successful."""
+    try:
+        def escape_string(s):
+            if s is None:
+                return 'NULL'
+            return f"'{s.replace("'", "''")}'"
+
+        values = [
+            validator_data["block_number"],
+            validator_data["timestamp"],
+            escape_string(validator_data['name']),
+            escape_string(validator_data['address']),
+            escape_string(validator_data['image']),
+            escape_string(validator_data['description']),
+            escape_string(validator_data['owner']),
+            escape_string(validator_data['url']),
+            validator_data["nominators"],
+            validator_data["daily_return"],
+            f"[{','.join(str(x) for x in validator_data['registrations'])}]",
+            f"[{','.join(str(x) for x in validator_data['validator_permits'])}]",
+            f"{{{','.join(f'{k}:{v}' for k,v in validator_data['subnet_hotkey_alpha'].items())}}}" if validator_data['subnet_hotkey_alpha'] else '{}'
+        ]
+
+        buffer_insert(table_name, values)
+        return True
+
+    except Exception as e:
+        logging.error(f"Error inserting validator {validator_data['address']}: {str(e)}")
+        return False
 
 
 class ValidatorsShovel(ShovelBaseClass):
@@ -364,75 +409,39 @@ class ValidatorsShovel(ShovelBaseClass):
         logging.info(f"ValidatorsShovel initialized with starting_block: {self.starting_block}")
 
     def process_block(self, n):
-        # Log every block to see if we're getting called
         if n % 10 == 0:
             logging.info(f"process_block called for block {n}")
 
-        if n % 100 != 0:
+        if n % 3600 != 0:
             return
 
         logging.info(f"=== STARTING TO PROCESS BLOCK {n} ===")
         try:
+            reconnect_substrate()
             logging.info(f"Processing block {n}")
             substrate = get_substrate_client()
             logging.info("Got substrate client")
 
-            (block_timestamp, block_hash) = get_block_metadata(n)
+            try:
+                (block_timestamp, block_hash) = get_block_metadata(n)
+            except:
+                substrate = get_substrate_client()
+                print("('------------------------------------------ sleep")
+                sleep(1)
+                (block_timestamp, block_hash) = get_block_metadata(n)
+                print("------------------------------------------ teraz powinno być gites")
+
             logging.info(f"Got block metadata: timestamp={block_timestamp}, hash={block_hash}")
 
             logging.info("About to create/check validators table...")
             create_validators_table(self.table_name)
             logging.info("Ensured validators table exists - ClickHouse connection successful!")
 
-            # Use the new logic
-            validators_data = fetch_all_validators_data_new(substrate, block_hash, block_timestamp, n)
-
-            successful_inserts = 0
-            for validator_data in validators_data:
-                try:
-                    def escape_string(s):
-                        if s is None:
-                            return 'NULL'
-                        return f"'{s.replace("'", "''")}'"
-
-                    values = [
-                        validator_data["block_number"],
-                        validator_data["timestamp"],
-                        escape_string(validator_data['name']),
-                        escape_string(validator_data['address']),
-                        escape_string(validator_data['image']),
-                        escape_string(validator_data['description']),
-                        escape_string(validator_data['owner']),
-                        escape_string(validator_data['url']),
-                        validator_data["nominators"],
-                        validator_data["daily_return"],
-                        f"[{','.join(str(x) for x in validator_data['registrations'])}]",
-                        f"[{','.join(str(x) for x in validator_data['validator_permits'])}]",
-                        f"{{{','.join(f'{k}:{v}' for k,v in validator_data['subnet_hotkey_alpha'].items())}}}" if validator_data['subnet_hotkey_alpha'] else '{}'
-                    ]
-
-                    buffer_insert(self.table_name, values)
-                    successful_inserts += 1
-
-                except Exception as e:
-                    logging.error(f"Error inserting validator {validator_data['address']}: {str(e)}")
-                    continue
-
-            # Count regular vs child key validators
-            regular_validators = len([v for v in validators_data if not v['is_child_key']])
-            child_key_validators = len([v for v in validators_data if v['is_child_key']])
-
-            logging.info(f"Block {n} summary:")
-            logging.info(f"- Total validators: {len(validators_data)}")
-            logging.info(f"- Regular validators: {regular_validators}")
-            logging.info(f"- Child key validators: {child_key_validators}")
-            logging.info(f"- Successful inserts: {successful_inserts}")
-
-            if successful_inserts < len(validators_data):
-                logging.warning(f"Only {successful_inserts}/{len(validators_data)} validators were successfully inserted")
+            # Use the new logic - this now inserts validators directly
+            successful_inserts = fetch_all_validators_data_new(substrate, block_hash, block_timestamp, n, self.table_name)
 
             logging.info(f"Successfully processed block {n}")
-            
+
             # Log buffer status
             if successful_inserts > 0:
                 logging.info(f"Added {successful_inserts} validators to buffer. Buffer will auto-flush based on size/time thresholds.")
@@ -443,11 +452,6 @@ class ValidatorsShovel(ShovelBaseClass):
         except Exception as e:
             logging.error(f"Error processing block {n}: {str(e)}")
             logging.error(traceback.format_exc())
-            # Try to reconnect substrate on JSON decode errors
-            if "JSONDecodeError" in str(e) or "websocket" in str(e).lower():
-                logging.info("Attempting to reconnect substrate due to connection error...")
-                from substrate import reconnect_substrate
-                reconnect_substrate()
             raise ShovelProcessingError(f"Failed to process block {n}: {str(e)}")
 
     def cleanup(self):
