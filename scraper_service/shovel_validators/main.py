@@ -4,7 +4,6 @@ from shared.clickhouse.utils import (
     get_clickhouse_client,
     table_exists,
 )
-from time import sleep
 from shared.shovel_base_class import ShovelBaseClass
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 from substrate import get_substrate_client, reconnect_substrate
@@ -399,14 +398,7 @@ class ValidatorsShovel(ShovelBaseClass):
             substrate = get_substrate_client()
             logging.info("Got substrate client")
 
-            try:
-                (block_timestamp, block_hash) = get_block_metadata(n)
-            except:
-                substrate = get_substrate_client()
-                print("('------------------------------------------ sleep")
-                sleep(1)
-                (block_timestamp, block_hash) = get_block_metadata(n)
-                print("------------------------------------------ teraz powinno być gites")
+            (block_timestamp, block_hash) = get_block_metadata(n)
 
             logging.info(f"Got block metadata: timestamp={block_timestamp}, hash={block_hash}")
 
