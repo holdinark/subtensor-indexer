@@ -31,7 +31,13 @@ async fn query_map_pending_emission_inner(block_hash: String) -> PyResult<Vec<(u
     let query = subtensor::storage()
         .subtensor_module()
         .pending_emission_iter();
-    let mut iter = api.storage().at(block_hash).iter(query).await.unwrap();
+    // Gracefully handle cases where the storage entry did not yet exist at the given block
+    let mut iter = match api.storage().at(block_hash).iter(query).await {
+        Ok(it) => it,
+        // If the storage entry is missing (e.g., early blocks before the runtime introduced it),
+        // return an empty vector instead of panicking.
+        Err(_) => return Ok(Vec::new()),
+    };
     let mut kvs = Vec::new();
     while let Some(Ok(kv)) = iter.next().await {
         let mut last_two_bytes = &kv.key_bytes[kv.key_bytes.len() - 2..];
@@ -51,7 +57,10 @@ async fn query_subnet_hotkeys_inner(
     let query = subtensor::storage()
         .subtensor_module()
         .keys_iter1(subnet_id);
-    let mut iter = api.storage().at(block_hash).iter(query).await.unwrap();
+    let mut iter = match api.storage().at(block_hash).iter(query).await {
+        Ok(it) => it,
+        Err(_) => return Ok(Vec::new()),
+    };
     let mut kvs = Vec::new();
     while let Some(Ok(kv)) = iter.next().await {
         let mut last_two_bytes = &kv.key_bytes[kv.key_bytes.len() - 2..];
@@ -68,12 +77,16 @@ async fn query_hotkey_stakes_inner(
 ) -> Vec<(String, u64)> {
     let hotkey = AccountId32::from_str(hotkey.as_str()).expect("Invalid hotkey");
     let query = subtensor::storage().subtensor_module().stake_iter1(hotkey);
-    let mut iter = api
+    // Gracefully handle missing storage entry for early blocks
+    let mut iter = match api
         .storage()
         .at(block_hash.clone())
         .iter(query)
         .await
-        .unwrap();
+    {
+        Ok(it) => it,
+        Err(_) => return Vec::new(),
+    };
     let mut kvs = Vec::new();
     while let Some(Ok(kv)) = iter.next().await {
         let last_32_bytes: [u8; 32] = kv.key_bytes[kv.key_bytes.len() - 32..].try_into().unwrap();

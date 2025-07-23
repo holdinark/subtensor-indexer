@@ -2,7 +2,7 @@ import os
 import logging
 import functools
 import inspect
-from opentelemetry import trace as otel_trace, metrics
+from opentelemetry import trace as ot_trace, metrics as ot_metrics
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
 from opentelemetry.sdk.trace import TracerProvider
@@ -58,9 +58,7 @@ class TelemetryManager:
                 for header in otlp_headers_raw.split(','):
                     if '=' in header:
                         key, value = header.split('=', 1)
-                        # OTLP spec requires header values to be URL encoded
-                        from urllib.parse import quote
-                        headers[key.strip()] = quote(value.strip(), safe="")
+                        headers[key.strip()] = value.strip()
 
             # Create resource with service name and additional attributes
             resource_dict = {
@@ -77,8 +75,8 @@ class TelemetryManager:
 
             resource = Resource.create(resource_dict)
 
-            # Set up tracer provider (using aliased module to avoid name shadowing)
-            otel_trace.set_tracer_provider(TracerProvider(resource=resource))
+            # Set up tracer provider
+            ot_trace.set_tracer_provider(TracerProvider(resource=resource))
 
             # Create OTLP trace exporter
             otlp_trace_exporter = OTLPSpanExporter(
@@ -88,7 +86,7 @@ class TelemetryManager:
 
             # Add span processor
             span_processor = BatchSpanProcessor(otlp_trace_exporter)
-            otel_trace.get_tracer_provider().add_span_processor(span_processor)
+            ot_trace.get_tracer_provider().add_span_processor(span_processor)
 
             # Set up metrics provider
             otlp_metric_exporter = OTLPMetricExporter(
@@ -101,13 +99,13 @@ class TelemetryManager:
                 export_interval_millis=30000,  # Export metrics every 30 seconds
             )
 
-            metrics.set_meter_provider(
+            ot_metrics.set_meter_provider(
                 MeterProvider(resource=resource, metric_readers=[metric_reader])
             )
 
             # Get tracer and meter for this service
-            self.tracer = otel_trace.get_tracer(final_service_name)
-            self.meter = metrics.get_meter(final_service_name)
+            self.tracer = ot_trace.get_tracer(final_service_name)
+            self.meter = ot_metrics.get_meter(final_service_name)
 
             # Enable logging instrumentation
             LoggingInstrumentor().instrument(set_logging_format=True)
@@ -145,6 +143,11 @@ def get_tracer():
 def get_meter():
     """Convenience function to get meter."""
     return telemetry_manager.get_meter()
+
+# Helper to get current active span
+def current_span():
+    """Return the currently active span from OpenTelemetry context."""
+    return ot_trace.get_current_span()
 
 
 # =============================================================================

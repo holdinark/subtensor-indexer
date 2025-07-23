@@ -6,7 +6,7 @@ from shared.clickhouse.utils import (
     table_exists,
 )
 from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
-from shared.telemetry import init_telemetry, get_tracer, trace_method, trace, get_metrics
+from shared.telemetry import init_telemetry, get_tracer, trace_method, trace, get_metrics, current_span
 from tqdm import tqdm
 import logging
 import threading
@@ -146,13 +146,11 @@ class ShovelBaseClass:
         batch_start_time = time()
 
         # Add batch metadata to current span
-        tracer = get_tracer()
-        if tracer:
-            span = get_current_span()
-            if span:
-                span.set_attribute("block_count", len(block_numbers))
-                span.set_attribute("start_block", block_numbers[0])
-                span.set_attribute("end_block", block_numbers[-1])
+        span = current_span()
+        if span:
+            span.set_attribute("block_count", len(block_numbers))
+            span.set_attribute("start_block", block_numbers[0])
+            span.set_attribute("end_block", block_numbers[-1])
 
         for block_number in tqdm(block_numbers):
             self._process_single_block(block_number)
@@ -171,11 +169,9 @@ class ShovelBaseClass:
         block_start_time = time()
 
         # Add block number to current span
-        tracer = get_tracer()
-        if tracer:
-            span = get_current_span()
-            if span:
-                span.set_attribute("block_number", block_number)
+        span = current_span()
+        if span:
+            span.set_attribute("block_number", block_number)
 
         # Update current block metric
         self.metrics.set_current_block(block_number, shovel_name=self.name)
@@ -199,11 +195,10 @@ class ShovelBaseClass:
             )
 
             # Mark successful processing in span
-            if tracer:
-                span = get_current_span()
-                if span:
-                    span.set_attribute("processing_successful", True)
-                    span.set_attribute("processing_duration_seconds", block_duration)
+            span = current_span()
+            if span:
+                span.set_attribute("processing_successful", True)
+                span.set_attribute("processing_duration_seconds", block_duration)
 
         except DatabaseConnectionError as e:
             self._record_error("database_connection", block_number, str(e))
@@ -219,14 +214,12 @@ class ShovelBaseClass:
         """Record error information in telemetry."""
         logging.error(f"{error_type.replace('_', ' ').title()} error while processing block {block_number}: {message}")
 
-        tracer = get_tracer()
-        if tracer:
-            span = get_current_span()
-            if span:
-                span.set_attribute("processing_successful", False)
-                span.set_attribute("error.type", exception_type or error_type)
-                span.set_attribute("error.message", message)
-                span.set_attribute("error.block_number", block_number)
+        span = current_span()
+        if span:
+            span.set_attribute("processing_successful", False)
+            span.set_attribute("error.type", exception_type or error_type)
+            span.set_attribute("error.message", message)
+            span.set_attribute("error.block_number", block_number)
 
     def _handle_database_error(self, error, retry_count):
         """Handle database connection errors with retry logic."""
@@ -244,12 +237,10 @@ class ShovelBaseClass:
     @trace("shovel.retry_delay")
     def _retry_delay(self, retry_count):
         """Execute retry delay with telemetry."""
-        tracer = get_tracer()
-        if tracer:
-            span = get_current_span()
-            if span:
-                span.set_attribute("retry_count", retry_count)
-                span.set_attribute("delay_seconds", self.RETRY_DELAY)
+        span = current_span()
+        if span:
+            span.set_attribute("retry_count", retry_count)
+            span.set_attribute("delay_seconds", self.RETRY_DELAY)
 
         sleep(self.RETRY_DELAY)
         reconnect_substrate()
@@ -258,11 +249,11 @@ class ShovelBaseClass:
         """Handle fatal errors and exit."""
         logging.error(f"Fatal shovel error: {message}")
 
-        tracer = get_tracer()
-        if tracer:
-            with tracer.start_as_current_span("shovel.fatal_error") as span:
-                span.set_attribute("error.type", error_type)
-                span.set_attribute("error.message", message)
+        span = current_span()
+        if span:
+            with span.start_child("shovel.fatal_error") as child_span:
+                child_span.set_attribute("error.type", error_type)
+                child_span.set_attribute("error.message", message)
 
         sys.exit(1)
 
@@ -297,13 +288,11 @@ class ShovelBaseClass:
     def _update_checkpoint_with_metrics(self, tables, rows):
         """Update checkpoint with flush metrics."""
         # Add metrics to current span
-        tracer = get_tracer()
-        if tracer:
-            span = get_current_span()
-            if span:
-                span.set_attribute("block_number", self.last_buffer_flush_call_block_number)
-                span.set_attribute("rows_flushed", rows)
-                span.set_attribute("tables_updated", tables)
+        span = current_span()
+        if span:
+            span.set_attribute("block_number", self.last_buffer_flush_call_block_number)
+            span.set_attribute("rows_flushed", rows)
+            span.set_attribute("tables_updated", tables)
 
         self._update_checkpoint()
 
