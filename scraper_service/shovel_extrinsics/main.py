@@ -74,13 +74,26 @@ def do_process_block(n):
                 call_function = extrinsic["call"]["call_function"]
                 call_module = extrinsic["call"]["call_module"]
 
-                base_column_names = ["block_number", "timestamp", "extrinsic_index",
-                                   "call_function", "call_module", "success", "address", "nonce", "tip"]
-                base_column_types = ["UInt64", "DateTime", "UInt64", "String",
-                                   "String", "Bool", "Nullable(String)", "Nullable(UInt64)", "Nullable(UInt64)"]
+                # Get extrinsic hash for Balances module
+                extrinsic_hash = None
+                if call_module == "Balances" and hasattr(e, 'extrinsic_hash'):
+                    extrinsic_hash = '0x' + e.extrinsic_hash.hex()
 
-                base_column_values = [format_value(value) for value in [
-                    n, block_timestamp, extrinsic_id, call_function, call_module, extrinsics_success_map[extrinsic_id], address, nonce, tip]]
+                # Build base columns - add hash for Balances module
+                if call_module == "Balances":
+                    base_column_names = ["block_number", "timestamp", "extrinsic_index",
+                                       "call_function", "call_module", "success", "address", "nonce", "tip", "hash"]
+                    base_column_types = ["UInt64", "DateTime", "UInt64", "String",
+                                       "String", "Bool", "Nullable(String)", "Nullable(UInt64)", "Nullable(UInt64)", "String"]
+                    base_column_values = [format_value(value) for value in [
+                        n, block_timestamp, extrinsic_id, call_function, call_module, extrinsics_success_map[extrinsic_id], address, nonce, tip, extrinsic_hash]]
+                else:
+                    base_column_names = ["block_number", "timestamp", "extrinsic_index",
+                                       "call_function", "call_module", "success", "address", "nonce", "tip"]
+                    base_column_types = ["UInt64", "DateTime", "UInt64", "String",
+                                       "String", "Bool", "Nullable(String)", "Nullable(UInt64)", "Nullable(UInt64)"]
+                    base_column_values = [format_value(value) for value in [
+                        n, block_timestamp, extrinsic_id, call_function, call_module, extrinsics_success_map[extrinsic_id], address, nonce, tip]]
 
                 # Let column generation errors propagate up - we want to fail on new extrinsic types
                 arg_column_names = []
