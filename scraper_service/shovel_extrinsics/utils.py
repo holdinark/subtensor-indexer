@@ -1,4 +1,5 @@
 import json
+import logging
 from functools import lru_cache
 from shared.clickhouse.utils import (
     escape_column_name,
@@ -60,15 +61,12 @@ def get_column_type(value, value_type=None, key=None):
         elif key in type_map:
             return type_map[key]
         else:
-            print(
-                f"Empty list and don't know what column type to use for key {
-                    key}!"
-            )
-            exit(1)
+            logging.error(f"Empty list and don't know what column type to use for key {key}!")
+            raise ValueError(f"Cannot determine column type for empty list with key {key}")
     elif value is None:
         return None
     else:
-        print(f"Unhandled type: {type(value)}")
+        logging.warning(f"Unhandled type: {type(value)} for value {value}, using String")
         return "String"
 
 
@@ -127,6 +125,10 @@ def generate_column_definitions(item, parent_key, item_type=None):
 
 
 def create_clickhouse_table(table_name, column_names, column_types):
+    logging.info(f"Creating table {table_name} with {len(column_names)} columns")
+    logging.debug(f"Column names: {column_names}")
+    logging.debug(f"Column types: {column_types}")
+    
     columns = list(
         map(
             lambda x, y: f"{escape_column_name(x)} {
@@ -146,8 +148,16 @@ def create_clickhouse_table(table_name, column_names, column_types):
     PARTITION BY toYYYYMM(timestamp)
     ORDER BY ({", ".join(order_by)})
     """
-
-    get_clickhouse_client().execute(sql)
+    
+    logging.debug(f"Executing CREATE TABLE SQL for {table_name}")
+    
+    try:
+        get_clickhouse_client().execute(sql)
+        logging.info(f"Successfully created table {table_name}")
+    except Exception as e:
+        logging.error(f"Failed to create table {table_name}: {str(e)}")
+        logging.error(f"SQL: {sql}")
+        raise
 
 
 @lru_cache(maxsize=None)
@@ -198,3 +208,4 @@ def get_table_name(module_id, function_id, columns):
                 return table_name
 
     logging.error(f"Max versions reached for extrinsic {extrinsic_id}")
+    raise ValueError(f"Max table versions ({MAX_VERSIONS}) reached for extrinsic {extrinsic_id}")
