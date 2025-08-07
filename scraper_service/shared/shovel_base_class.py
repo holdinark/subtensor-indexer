@@ -55,7 +55,7 @@ class ShovelBaseClass:
                 while True:
                     try:
                         last_scraped_block_number = self._process_blocks_cycle(
-                            last_scraped_block_number, finalized_block_number, substrate
+                            last_scraped_block_number, substrate
                         )
 
                         # Reset retry count on successful iteration
@@ -114,8 +114,12 @@ class ShovelBaseClass:
         return last_scraped_block_number
 
     @trace_method("shovel.processing_cycle", attributes={"stage": "main_loop"})
-    def _process_blocks_cycle(self, last_scraped_block_number, finalized_block_number, substrate):
+    def _process_blocks_cycle(self, last_scraped_block_number, substrate):
         """Process a cycle of blocks."""
+        # Fetch current finalized block
+        finalized_block_hash = substrate.get_chain_finalised_head()
+        finalized_block_number = substrate.get_block_number(finalized_block_hash)
+        
         block_numbers = list(range(
             last_scraped_block_number + 1,
             finalized_block_number + 1,
@@ -135,8 +139,6 @@ class ShovelBaseClass:
         # Make sure to sleep so buffer with checkpoint update is flushed to Clickhouse
         sleep(12)
         last_scraped_block_number = self.get_checkpoint()
-        finalized_block_hash = substrate.get_chain_finalised_head()
-        finalized_block_number = substrate.get_block_number(finalized_block_hash)
 
         return last_scraped_block_number
 
