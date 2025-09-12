@@ -10,7 +10,7 @@ from shared.exceptions import DatabaseConnectionError, ShovelProcessingError
 import logging
 import os
 from scalecodec.utils.ss58 import ss58_encode
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(process)d %(message)s")
@@ -40,6 +40,9 @@ if subnet_hotkeys_env:
         raise ValueError(f"Invalid TAOCOM_SUBNET_VALIDATOR_HOTKEYS format: {subnet_hotkeys_env}")
 
 SS58_FORMAT = 42
+U64_MAX = (1 << 64) - 1
+U16_MAX = (1 << 16) - 1
+BLOCK_SECONDS = 12
 
 def decode_account_id(account_id_bytes):
     if hasattr(account_id_bytes, 'value'):
@@ -82,14 +85,11 @@ class SubnetAPYShovel(ShovelBaseClass):
 def do_process_block(n, table_name):
     """
     SAMPLING STRATEGY:
-    - Process only ONE epoch per subnet per day (instead of ~20)
+    - Process only ONE epoch per subnet per day
     - Once all subnets are sampled for current day, skip to midnight UTC
-    - This reduces processing by ~95% while maintaining accuracy
-    - APY calculation will extrapolate: (1 + avg_yield)^epochs_per_year - 1
     """
     global last_epoch_blocks, daily_sampled_subnets, next_check_block
 
-    # Skip blocks until next_check_block (set when all subnets sampled)
     if n < next_check_block:
         logging.debug(f"Block {n}: Skipping (already sampled all subnets until block {next_check_block})")
         return
@@ -153,28 +153,23 @@ def do_process_block(n, table_name):
 
             remaining_subnets = all_subnet_ids - daily_sampled_subnets[current_date]
             if not remaining_subnets:
-                # All subnets sampled for today - skip to midnight tomorrow
-                from datetime import datetime, timedelta
                 current_dt = datetime.fromtimestamp(block_timestamp, tz=timezone.utc)
                 next_midnight = current_dt.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
                 seconds_to_skip = (next_midnight - current_dt).total_seconds()
-                blocks_to_skip = max(1, int(seconds_to_skip / 12))  # ~12 seconds per block
+                blocks_to_skip = max(1, int(seconds_to_skip / BLOCK_SECONDS))
                 next_check_block = n + blocks_to_skip
 
                 logging.info(f"Block {n}: All {len(all_subnet_ids)} subnets sampled for {current_date}")
                 logging.info(f"  Skipping to midnight: {next_midnight.strftime('%Y-%m-%d')} (block ~{next_check_block})")
                 return
 
-            # Log progress
             if n % 100 == 0:
                 logging.info(f"Block {n}: Date {current_date}, sampled {len(daily_sampled_subnets[current_date])}/{len(all_subnet_ids)} subnets")
 
             for storage_key, pending_emission in pending_emissions_result:
-                # Extract subnet_id - it's directly in the storage_key for PendingEmission
                 subnet_id = storage_key.value if hasattr(storage_key, 'value') else storage_key
 
-                # Skip if we already sampled this subnet today
                 if subnet_id in daily_sampled_subnets[current_date]:
                     continue
 
@@ -186,7 +181,7 @@ def do_process_block(n, table_name):
                 prev_emission = last_epoch_blocks[subnet_id]["emission"]
                 curr_emission = pending_emission.value if hasattr(pending_emission, 'value') else pending_emission
 
-                # Epoch occurred when pending_emission resets to 0
+                # Is it a new epoch?
                 if curr_emission == 0 and prev_emission > 0:
                     logging.info(f"\n{'='*60}")
                     logging.info(f"Block {n}: EPOCH DETECTED for subnet {subnet_id} (Date: {current_date})")
@@ -194,10 +189,8 @@ def do_process_block(n, table_name):
                     logging.info(f"  Daily sampling: {len(daily_sampled_subnets[current_date])+1}/{len(all_subnet_ids)} subnets sampled")
                     logging.info(f"{'='*60}")
 
-                    # Process this epoch
                     process_subnet_epoch(n, block_timestamp, block_hash, subnet_id, table_name, substrate)
 
-                    # Mark this subnet as sampled for today
                     daily_sampled_subnets[current_date].add(subnet_id)
 
                     logging.info(f"{'='*60}\n")
@@ -216,15 +209,13 @@ def do_process_block(n, table_name):
 
 
 def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, table_name, substrate):
-    """Process APY data for TAO.com's validator on this subnet at epoch boundary"""
+    """Process APY data for Validator's validator on this subnet at epoch boundary"""
     try:
         validator_hotkey = get_validator_hotkey_for_subnet(subnet_id)
         logging.info(f"\n>>> Processing epoch for subnet {subnet_id}")
         logging.info(f"    Block: {block_number}, Timestamp: {block_timestamp}")
-        logging.info(f"    TAO.com validator: {validator_hotkey}")
+        logging.info(f"    Validator's hotkey: {validator_hotkey}")
 
-        # Check if TAO.com delegates to childkeys on this subnet
-        # ChildKeys[parent, netuid] returns list of (proportion, child) that the parent delegates TO
         try:
             children_result = substrate.query(
                 module="SubtensorModule",
@@ -236,27 +227,24 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
             child_validators = []
             if children_result and children_result.value:
                 children_list = children_result.value if hasattr(children_result, 'value') else children_result
-                logging.info(f"Subnet {subnet_id}: TAO.com has {len(children_list)} childkey(s)")
+                logging.info(f"Subnet {subnet_id}: Validator has {len(children_list)} childkey(s)")
                 for proportion, child_hotkey in children_list:
                     child_key = decode_account_id(child_hotkey.value if hasattr(child_hotkey, 'value') else child_hotkey)
                     child_validators.append((proportion, child_key))
-                    proportion_pct = (proportion * 100) / (2**64)
+                    proportion_pct = (proportion * 100) / U64_MAX
                     logging.info(f"  - Childkey {child_key[:8]}...: {proportion_pct:.2f}% delegation (proportion={proportion})")
             else:
-                logging.debug(f"Subnet {subnet_id}: TAO.com has no childkeys, checking direct registration")
+                logging.debug(f"Subnet {subnet_id}: Validator has no childkeys, checking direct registration")
         except Exception as e:
             logging.warning(f"Failed to check child keys for {validator_hotkey[:8]} on subnet {subnet_id}: {str(e)}")
             child_validators = []
 
-        # TAO.com participates either directly or through childkeys
-        # Check if TAO.com is registered directly OR has childkeys on this subnet
         validators_to_check = [validator_hotkey] + [child for _, child in child_validators]
 
         if not child_validators:
-            # No childkeys, TAO.com must be registered directly
-            logging.debug(f"No childkeys found, checking if TAO.com is registered directly on subnet {subnet_id}")
+            logging.debug(f"No childkeys found, checking if Validator is registered directly on subnet {subnet_id}")
         else:
-            logging.debug(f"Checking TAO.com and {len(child_validators)} childkey(s) on subnet {subnet_id}")
+            logging.debug(f"Checking Validator and {len(child_validators)} childkey(s) on subnet {subnet_id}")
 
         try:
             keys_result = substrate.query_map(
@@ -274,23 +262,22 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
                 if decoded_hotkey in validators_to_check:
                     validators_found.add(decoded_hotkey)
 
-            logging.debug(f"Subnet {subnet_id}: Found {len(validators_found)} TAO.com-related validator(s) out of {hotkey_count} total")
+            logging.debug(f"Subnet {subnet_id}: Found {len(validators_found)} Validator-related validator(s) out of {hotkey_count} total")
 
-            # Get TaoWeight first (needed for all cases)
             tao_weight_result = substrate.query(
                 module="SubtensorModule",
                 storage_function="TaoWeight",
                 block_hash=block_hash
             )
-            tao_weight = (tao_weight_result.value if hasattr(tao_weight_result, 'value') else tao_weight_result) / 65535.0 if tao_weight_result else 0.5
-
             if tao_weight_result is None:
-                logging.error(f"Failed to get TaoWeight for block {block_hash}")
-                raise ShovelProcessingError("Could not fetch TaoWeight")
+                logging.error(f"Failed to get TaoWeight for block {block_hash} - skipping epoch")
+                return
+
+            tao_weight_raw = tao_weight_result.value if hasattr(tao_weight_result, 'value') else tao_weight_result
+            tao_weight = tao_weight_raw / U64_MAX
 
             if not validators_found:
-                logging.info(f"Subnet {subnet_id}: TAO.com not participating (neither directly nor via childkeys) - setting APY to 0")
-                # Set APY to 0 for this subnet as requested
+                logging.info(f"Subnet {subnet_id}: Validator not participating (neither directly nor via childkeys) - setting APY to 0")
                 buffer_insert(table_name, [
                     block_number,
                     block_timestamp,
@@ -307,20 +294,17 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
 
             is_direct = validator_hotkey in validators_found
             num_childkeys = len([c for _, c in child_validators if c in validators_found])
-            logging.info(f"Subnet {subnet_id}: TAO.com participates via: direct={is_direct}, childkeys={num_childkeys}")
+            logging.info(f"Subnet {subnet_id}: Validator participates via: direct={is_direct}, childkeys={num_childkeys}")
 
         except Exception as e:
             logging.warning(f"Failed to check validator existence on subnet {subnet_id}: {str(e)}")
             return
 
         try:
-            # Calculate effective stake and dividends
-            # TAO.com either validates directly or delegates to childkeys
             total_subnet_stake = 0
             total_root_stake = 0
             total_subnet_dividend = 0
 
-            # Get TAO.com's own stake (always exists)
             tao_stake_result = substrate.query(
                 module="SubtensorModule",
                 storage_function="TotalHotkeyAlpha",
@@ -337,15 +321,12 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
             )
             tao_root_stake = tao_root_result.value if hasattr(tao_root_result, 'value') else tao_root_result or 0
 
-            logging.debug(f"TAO.com base stakes - subnet: {tao_subnet_stake}, root: {tao_root_stake}")
+            logging.debug(f"Validator base stakes - subnet: {tao_subnet_stake}, root: {tao_root_stake}")
 
-            # Process based on participation type
             if validator_hotkey in validators_found:
-                # TAO.com is registered directly on this subnet
                 total_subnet_stake = tao_subnet_stake
                 total_root_stake = tao_root_stake
 
-                # Get direct dividends
                 dividend_result = substrate.query(
                     module="SubtensorModule",
                     storage_function="AlphaDividendsPerSubnet",
@@ -355,25 +336,22 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
                 direct_dividend = dividend_result.value if hasattr(dividend_result, 'value') else dividend_result or 0
                 total_subnet_dividend = direct_dividend
 
-                logging.info(f"Subnet {subnet_id}: TAO.com DIRECT validation - stake={tao_subnet_stake}, dividend={direct_dividend}")
+                logging.info(f"Subnet {subnet_id}: Validator DIRECT validation - stake={tao_subnet_stake}, dividend={direct_dividend}")
 
-            # Process childkeys if they exist (TAO.com delegates TO them)
             for proportion, child_hotkey in child_validators:
                 if child_hotkey in validators_found:
-                    # When TAO.com delegates to a childkey:
-                    # - TAO.com's stake is reduced by the delegated amount
+                    # When Validator delegates to a childkey:
+                    # - Validator's stake is reduced by the delegated amount
                     # - The childkey does the work and earns dividends
-                    # - TAO.com (parent) gets (1 - childkey_take) of those dividends
+                    # - Validator (parent) gets (1 - childkey_take) of those dividends
 
-                    # Calculate how much stake TAO.com delegates to this childkey
-                    delegated_stake = (proportion * tao_subnet_stake) // (2**64)
-                    delegated_root_stake = (proportion * tao_root_stake) // (2**64)
+                    # This is how apy_calculator logic works
+                    delegated_stake = (proportion * tao_subnet_stake) // U64_MAX
+                    delegated_root_stake = (proportion * tao_root_stake) // U64_MAX
 
-                    # Add the delegated stake to effective stake (TAO.com still owns it)
                     total_subnet_stake += delegated_stake
                     total_root_stake += delegated_root_stake
 
-                    # Get dividends earned by the childkey
                     child_dividend_result = substrate.query(
                         module="SubtensorModule",
                         storage_function="AlphaDividendsPerSubnet",
@@ -382,7 +360,6 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
                     )
                     child_dividend = child_dividend_result.value if hasattr(child_dividend_result, 'value') else child_dividend_result or 0
 
-                    # Get childkey take percentage (what percentage the childkey keeps)
                     childkey_take_result = substrate.query(
                         module="SubtensorModule",
                         storage_function="ChildkeyTake",
@@ -391,13 +368,12 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
                     )
                     childkey_take = childkey_take_result.value if hasattr(childkey_take_result, 'value') else childkey_take_result or 0
 
-                    # TAO.com (parent) gets (1 - childkey_take) of the childkey's dividends
-                    parent_share = (child_dividend * (65535 - childkey_take)) // 65535  # take is u16, max 65535
+                    parent_share = (child_dividend * (U16_MAX - childkey_take)) // U16_MAX
                     total_subnet_dividend += parent_share
 
-                    take_pct = (childkey_take * 100) / 65535
+                    take_pct = (childkey_take * 100) / U16_MAX
                     parent_pct = 100 - take_pct
-                    logging.info(f"  Childkey {child_hotkey[:8]}: stake={delegated_stake}, dividend={child_dividend}, TAO.com gets {parent_pct:.1f}% = {parent_share}")
+                    logging.info(f"  Childkey {child_hotkey[:8]}: stake={delegated_stake}, dividend={child_dividend}, Validator gets {parent_pct:.1f}% = {parent_share}")
 
             subnet_stake = total_subnet_stake
             root_stake = total_root_stake
@@ -425,12 +401,12 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
             ])
 
             if subnet_dividend > 0:
-                logging.info(f"Subnet {subnet_id}: ✅ TAO.com earned {subnet_dividend} dividends, epoch yield={epoch_yield:.6f}")
+                logging.info(f"Subnet {subnet_id}: ✅ Validator earned {subnet_dividend} dividends, epoch yield={epoch_yield:.6f}")
             else:
-                logging.info(f"Subnet {subnet_id}: ⚠️ TAO.com earned 0 dividends (stake={subnet_stake}, root={root_stake}, combined={combined_stake})")
+                logging.info(f"Subnet {subnet_id}: ⚠️ Validator earned 0 dividends (stake={subnet_stake}, root={root_stake}, combined={combined_stake})")
 
         except Exception as e:
-            logging.warning(f"Failed to process TAO.com validator {validator_hotkey} on subnet {subnet_id}: {str(e)}")
+            logging.warning(f"Failed to process Validator validator {validator_hotkey} on subnet {subnet_id}: {str(e)}")
 
     except Exception as e:
         raise ShovelProcessingError(f"Failed to process subnet epoch for subnet {subnet_id}: {str(e)}")
