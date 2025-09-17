@@ -86,6 +86,7 @@ type_map = {
     "call__call_args": "Array(String)",
     "transaction__EIP1559__access_list": "Array(String)",
     "children": "Array(Tuple(UInt64, String))",
+    "access_list": "String",
 }
 
 
