@@ -73,10 +73,10 @@ class SubnetAPYShovel(ShovelBaseClass):
 
     def __init__(self, name):
         super().__init__(name)
-        # since this shovel starts on Sep11, lets
-        # start indexing from Aug11 to get a full
+        # since this shovel starts on Sep25, lets
+        # start indexing from Aug25 to get a full
         # 30day APY today
-        self.starting_block = 6200000
+        self.starting_block = 6300000
 
     def process_block(self, n):
         do_process_block(n, self.table_name)
@@ -340,12 +340,6 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
 
             for proportion, child_hotkey in child_validators:
                 if child_hotkey in validators_found:
-                    # When Validator delegates to a childkey:
-                    # - The stake is transferred to the child on-chain
-                    # - The child's TotalHotkeyAlpha contains the actual working stake
-                    # - The child earns dividends based on their stake
-                    # - Validator (parent) gets (1 - childkey_take) of those dividends
-
                     child_subnet_stake_result = substrate.query(
                         module="SubtensorModule",
                         storage_function="TotalHotkeyAlpha",
