@@ -341,16 +341,29 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
             for proportion, child_hotkey in child_validators:
                 if child_hotkey in validators_found:
                     # When Validator delegates to a childkey:
-                    # - Validator's stake is reduced by the delegated amount
-                    # - The childkey does the work and earns dividends
+                    # - The stake is transferred to the child on-chain
+                    # - The child's TotalHotkeyAlpha contains the actual working stake
+                    # - The child earns dividends based on their stake
                     # - Validator (parent) gets (1 - childkey_take) of those dividends
 
-                    # This is how apy_calculator logic works
-                    delegated_stake = (proportion * tao_subnet_stake) // U64_MAX
-                    delegated_root_stake = (proportion * tao_root_stake) // U64_MAX
+                    child_subnet_stake_result = substrate.query(
+                        module="SubtensorModule",
+                        storage_function="TotalHotkeyAlpha",
+                        params=[child_hotkey, subnet_id],
+                        block_hash=block_hash
+                    )
+                    child_subnet_stake = child_subnet_stake_result.value if hasattr(child_subnet_stake_result, 'value') else child_subnet_stake_result or 0
 
-                    total_subnet_stake += delegated_stake
-                    total_root_stake += delegated_root_stake
+                    child_root_stake_result = substrate.query(
+                        module="SubtensorModule",
+                        storage_function="TotalHotkeyAlpha",
+                        params=[child_hotkey, 0],
+                        block_hash=block_hash
+                    )
+                    child_root_stake = child_root_stake_result.value if hasattr(child_root_stake_result, 'value') else child_root_stake_result or 0
+
+                    total_subnet_stake += child_subnet_stake
+                    total_root_stake += child_root_stake
 
                     child_dividend_result = substrate.query(
                         module="SubtensorModule",
@@ -373,13 +386,20 @@ def process_subnet_epoch(block_number, block_timestamp, block_hash, subnet_id, t
 
                     take_pct = (childkey_take * 100) / U16_MAX
                     parent_pct = 100 - take_pct
-                    logging.info(f"  Childkey {child_hotkey[:8]}: stake={delegated_stake}, dividend={child_dividend}, Validator gets {parent_pct:.1f}% = {parent_share}")
+                    proportion_pct = (proportion * 100) / U64_MAX
+                    logging.info(f"  Childkey {child_hotkey[:8]}: delegation={proportion_pct:.2f}%, stake={child_subnet_stake}, dividend={child_dividend}, Validator gets {parent_pct:.1f}% = {parent_share}")
 
             subnet_stake = total_subnet_stake
             root_stake = total_root_stake
             subnet_dividend = total_subnet_dividend
 
-            epoch_yield = float(subnet_dividend) / float(subnet_stake) if subnet_stake > 0 else 0.0
+            MIN_STAKE_THRESHOLD = 10  # Minimum stake in rao to consider valid
+
+            if subnet_stake < MIN_STAKE_THRESHOLD:
+                epoch_yield = 0.0
+                logging.warning(f"Subnet {subnet_id}: Stake {subnet_stake} below minimum threshold {MIN_STAKE_THRESHOLD}, setting yield to 0")
+            else:
+                epoch_yield = float(subnet_dividend) / float(subnet_stake)
 
             #
             combined_stake = root_stake * tao_weight + subnet_stake
