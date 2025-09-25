@@ -31,3 +31,9 @@ urllib3==2.2.2
 websocket-client==1.8.0
 xxhash==3.4.1
 requests
+
+# OpenTelemetry dependencies
+opentelemetry-api==1.26.0
+opentelemetry-sdk==1.26.0
+opentelemetry-exporter-otlp-proto-http==1.26.0
+opentelemetry-instrumentation-logging==0.47b0
