@@ -230,6 +230,12 @@ def do_process_block(n, table_name):
             flush_buffer_immediately()
             logging.info(f"Successfully flushed APY data to ClickHouse for block {n}")
 
+            # Manually update checkpoint to avoid recalculating if we crash before next block
+            logging.info(f"Updating checkpoint to block {n}...")
+            buffer_insert("shovel_checkpoints", [f"'root_apy'", n])
+            flush_buffer_immediately()
+            logging.info(f"Checkpoint updated to block {n}")
+
         except Exception as e:
             raise ShovelProcessingError(f"Failed to calculate/insert APY data: {str(e)}")
 
