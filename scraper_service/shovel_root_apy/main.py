@@ -1,7 +1,6 @@
 from shared.block_metadata import get_block_metadata
 from shared.clickhouse.batch_insert import buffer_insert
 from shared.shovel_base_class import ShovelBaseClass
-from substrate import get_substrate_client
 from shared.clickhouse.utils import (
     get_clickhouse_client,
     table_exists,
@@ -11,6 +10,7 @@ import logging
 import os
 import asyncio
 from typing import List, Dict
+from bittensor import AsyncSubtensor
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(process)d %(message)s")
@@ -19,7 +19,6 @@ VALIDATOR_HOTKEY = os.environ.get('TAOCOM_VALIDATOR_HOTKEY')
 if not VALIDATOR_HOTKEY:
     raise ValueError("TAOCOM_VALIDATOR_HOTKEY environment variable must be set")
 
-# Constants from apy-calculator
 BLOCK_SECONDS = 12
 INTERVAL_SECONDS = {
     "30d": 60 * 60 * 24 * 30,
@@ -28,7 +27,6 @@ INTERVAL_SECONDS = {
 REQUIRED_BLOCKS_RATIO = 0.9
 MIN_STAKE_THRESHOLD = 4000
 
-# Calculate APY every 24 hours (7200 blocks)
 BLOCKS_PER_24H = 24 * 60 * 60 // BLOCK_SECONDS
 
 
@@ -40,7 +38,6 @@ class RootAPYShovel(ShovelBaseClass):
         self.starting_block = 6650338
 
     def process_block(self, n):
-        # Calculate APY once every 24 hours
         if n % BLOCKS_PER_24H != 0:
             return
         do_process_block(n, self.table_name)
@@ -51,14 +48,14 @@ def calculate_apy(yield_value, compound_periods):
     return ((1 + yield_value) ** compound_periods - 1) * 100
 
 
-async def calculate_root_apy_async(substrate, hotkey: str, block: int, batch_size: int = 100) -> tuple:
+async def calculate_root_apy_async(node_url: str, hotkey: str, block: int, batch_size: int = 100) -> tuple:
     """
     Calculate root APY using the same logic as apy-calculator/root_apy.py
+    Uses bittensor AsyncSubtensor to properly query the chain
 
     Returns:
         tuple: (apy, total_root_divs, period_yield, events_processed, events_skipped)
     """
-    # Calculate the interval in blocks (30 days)
     interval = "30d"
     interval_seconds = INTERVAL_SECONDS[interval]
     actual_interval_blocks = int(interval_seconds / BLOCK_SECONDS)
@@ -67,71 +64,42 @@ async def calculate_root_apy_async(substrate, hotkey: str, block: int, batch_siz
 
     logging.info(f"Calculating root APY for {hotkey} from block {start_block} to {block}")
 
-    # Fetch subnet info synchronously
-    block_hash = substrate.get_block_hash(block)
-    result = substrate.runtime_call(
-        api="SubnetInfoRuntimeApi",
-        method="get_all_dynamic_info",
-        params=[],
-        block_hash=block_hash
-    )
-    subnets = result.value
+    async with AsyncSubtensor(node_url) as subtensor:
+        subnets = await subtensor.get_all_subnets_info(block=block)
+        events: List[Dict] = []
+        for subnet in subnets:
+            netuid = subnet.netuid
+            tempo = subnet.tempo
+            period = tempo + 1
+            last_epoch_block = block - subnet.blocks_since_epoch
+            epoch = last_epoch_block
 
-    # Build list of epoch events across all subnets
-    events: List[Dict] = []
-    for subnet_data in subnets:
-        netuid = subnet_data['netuid']
-        tempo = subnet_data['tempo']
-        blocks_since_epoch = subnet_data['blocks_since_epoch']
+            while epoch >= start_block:
+                events.append({"block": epoch, "netuid": netuid, "tempo": tempo})
+                epoch -= period
 
-        period = tempo + 1  # Epoch period in blocks
-        last_epoch_block = block - blocks_since_epoch
-        epoch = last_epoch_block
+        events.sort(key=lambda x: (x["block"], x["netuid"]))
 
-        while epoch >= start_block:
-            events.append({"block": epoch, "netuid": netuid, "tempo": tempo})
-            epoch -= period
+        logging.info(f"Processing {len(events)} epoch events across all subnets")
 
-    # Sort events for consistent processing
-    events.sort(key=lambda x: (x["block"], x["netuid"]))
+        root_divs: List[int] = []
+        for event in events:
+            try:
+                result = await subtensor.query_subtensor("TaoDividendsPerSubnet", block=event["block"], params=[event["netuid"], hotkey])
+                root_divs.append(result.value if result else 0)
+            except Exception as e:
+                logging.warning(f"Failed to fetch dividend for block {event['block']}, netuid {event['netuid']}: {e}")
+                root_divs.append(-1)
 
-    logging.info(f"Processing {len(events)} epoch events across all subnets")
+        stakes: List[int] = []
+        for event in events:
+            try:
+                result = await subtensor.query_subtensor("TotalHotkeyAlpha", block=event["block"], params=[hotkey, 0])
+                stakes.append(result.value if result else 0)
+            except Exception as e:
+                logging.warning(f"Failed to fetch stake for block {event['block']}: {e}")
+                stakes.append(-1)
 
-    # Fetch dividends
-    root_divs: List[int] = []
-    for event in events:
-        try:
-            event_block_hash = substrate.get_block_hash(event["block"])
-            result = substrate.query(
-                module="SubtensorModule",
-                storage_function="TaoDividendsPerSubnet",
-                params=[event["netuid"], hotkey],
-                block_hash=event_block_hash
-            )
-            div_value = result.value if result and hasattr(result, 'value') else 0
-            root_divs.append(div_value or 0)
-        except Exception as e:
-            logging.warning(f"Failed to fetch dividend for block {event['block']}, netuid {event['netuid']}: {e}")
-            root_divs.append(-1)
-
-    # Fetch stakes
-    stakes: List[int] = []
-    for event in events:
-        try:
-            event_block_hash = substrate.get_block_hash(event["block"])
-            result = substrate.query(
-                module="SubtensorModule",
-                storage_function="TotalHotkeyAlpha",
-                params=[hotkey, 0],  # 0 = root network
-                block_hash=event_block_hash
-            )
-            stake_value = result.value if result and hasattr(result, 'value') else 0
-            stakes.append(stake_value or 0)
-        except Exception as e:
-            logging.warning(f"Failed to fetch stake for block {event['block']}: {e}")
-            stakes.append(-1)
-
-    # Process results and compute compounded yield
     yield_product = 1.0
     total_root_divs = 0
     skipped = 0
@@ -141,16 +109,13 @@ async def calculate_root_apy_async(substrate, hotkey: str, block: int, batch_siz
         root_div = root_divs[event_index]
         stake = stakes[event_index]
 
-        # No dividends has no effect on the yield product.
         if root_div == 0:
             continue
 
-        # Such cases mean that the query failed or stake is zero (zero division).
         if root_div == -1 or stake == -1 or stake == 0:
             skipped += 1
             continue
 
-        # Filter validators with stake less than MIN_STAKE_THRESHOLD
         if stake < MIN_STAKE_THRESHOLD:
             skipped += 1
             continue
@@ -165,7 +130,6 @@ async def calculate_root_apy_async(substrate, hotkey: str, block: int, batch_siz
         if len(events) - skipped < REQUIRED_BLOCKS_RATIO * len(events):
             logging.warning(f"Coverage is less than: {REQUIRED_BLOCKS_RATIO * 100:.6f}% - may lead to inaccurate results.")
 
-    # Calculate period yield and APY
     period_yield = yield_product - 1
     logging.info(f"Total {interval} yield: {period_yield * 100:.6f}%")
     logging.info(f"Total {interval} dividends: {total_root_divs / 1e9:.6f} TAO")
@@ -201,7 +165,6 @@ def do_process_block(n, table_name):
             raise DatabaseConnectionError(f"Failed to create/check table: {str(e)}")
 
         try:
-            substrate = get_substrate_client()
             (block_timestamp, block_hash) = get_block_metadata(n)
         except Exception as e:
             raise ShovelProcessingError(f"Failed to get block metadata: {str(e)}")
@@ -211,15 +174,17 @@ def do_process_block(n, table_name):
             logging.info(f"Block {n}: Calculating Root APY for {VALIDATOR_HOTKEY}")
             logging.info(f"{'='*60}")
 
-            # Calculate APY using async function (but run it synchronously in this context)
+            node_url = os.getenv("SUBSTRATE_ARCHIVE_NODE_URL")
+            if not node_url:
+                raise ShovelProcessingError("SUBSTRATE_ARCHIVE_NODE_URL environment variable not set")
+
             apy, total_divs, period_yield, processed, skipped = asyncio.run(
-                calculate_root_apy_async(substrate, VALIDATOR_HOTKEY, n)
+                calculate_root_apy_async(node_url, VALIDATOR_HOTKEY, n)
             )
 
             logging.info(f"Block {n}: Root APY = {apy:.6f}%")
             logging.info(f"{'='*60}\n")
 
-            # Insert into ClickHouse
             buffer_insert(table_name, [
                 n,
                 block_timestamp,

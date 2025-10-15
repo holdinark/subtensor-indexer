@@ -331,6 +331,28 @@ services:
       - 'host.docker.internal:host-gateway'
     tty: true
 
+  shovel_root_apy:
+    build:
+      context: ./scraper_service
+      dockerfile: ./shovel_root_apy/Dockerfile
+    container_name: shovel_root_apy
+    depends_on:
+      clickhouse:
+        condition: service_started
+    env_file:
+      - .env
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '10m'
+        max-file: '3'
+    networks:
+      - app_network
+    restart: on-failure
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+    tty: true
+
   # shovel_balance_map:
   #   build:
   #     context: ./scraper_service
