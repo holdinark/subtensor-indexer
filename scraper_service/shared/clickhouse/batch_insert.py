@@ -67,6 +67,27 @@ def buffer_insert(table_name, row):
         sleep(1)
 
 
+def flush_buffer_immediately():
+    """
+    Immediately flush the buffer for all tables.
+    Useful for critical data that should be persisted right away.
+    """
+    global buffer
+    debug_log("Immediate buffer flush requested")
+    with buffer_lock:
+        tasks = [(table_name, rows) for table_name, rows in buffer.items()]
+        buffer.clear()
+        debug_log(f"Immediate flush: Cleared buffer. Tasks to process: {len(tasks)}")
+
+    for table_name, rows in tasks:
+        try:
+            batch_insert_into_clickhouse_table(table_name, rows)
+            debug_log(f"Immediate flush: Successfully inserted {len(rows)} rows into {table_name}")
+        except Exception as e:
+            debug_log(f"Immediate flush: Failed to insert into {table_name}: {str(e)}")
+            raise
+
+
 # Continuously flush the buffer
 def flush_buffer(executor, started_cb, done_cb):
     """
